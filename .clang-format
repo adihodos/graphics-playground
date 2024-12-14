@@ -1,0 +1,12 @@
+﻿---
+BasedOnStyle: Mozilla
+BreakBeforeBraces: Mozilla
+ColumnLimit: '120'
+ConstructorInitializerIndentWidth: '4'
+ContinuationIndentWidth: '4'
+IndentWidth: '4'
+TabWidth: '4'
+UseTab: Never
+SortIncludes: false
+
+...

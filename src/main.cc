@@ -125,6 +125,40 @@ classify_shader_file(const filesystem::path& fspath)
     return nullopt;
 }
 
+struct shader_log_tag
+{};
+struct program_log_tag
+{};
+
+template<typename log_tag>
+void
+print_log_tag(const GLuint obj)
+{
+    char temp_buff[1024];
+    GLsizei log_size{};
+
+    if constexpr (is_same_v<log_tag, shader_log_tag>) {
+        glGetShaderiv(obj, GL_INFO_LOG_LENGTH, &log_size);
+    } else if constexpr (is_same_v<log_tag, program_log_tag>) {
+        glGetProgramiv(obj, GL_INFO_LOG_LENGTH, &log_size);
+    }
+
+    if (log_size <= 0) {
+        return;
+    }
+
+    log_size = min<GLsizei>(log_size, size(temp_buff));
+
+    if constexpr (is_same_v<log_tag, shader_log_tag>) {
+        glGetShaderInfoLog(obj, log_size - 1, &log_size, temp_buff);
+    } else if constexpr (is_same_v<log_tag, program_log_tag>) {
+        glGetProgramInfoLog(obj, log_size - 1, &log_size, temp_buff);
+    }
+
+    temp_buff[log_size] = 0;
+    LOG_ERROR(g_logger, "program|shader {} error:\n{}", obj, temp_buff);
+}
+
 GLuint
 compile_shader_from_memory(const GLenum shader_kind_gl,
                            const shaderc_shader_kind shader_kind_sc,
@@ -160,6 +194,9 @@ compile_shader_from_memory(const GLenum shader_kind_gl,
     //       break;
     //   }
     // }(shader_type);
+    compile_options.SetOptimizationLevel(optimize ? shaderc_optimization_level_performance
+                                                  : shaderc_optimization_level_zero);
+    compile_options.SetTargetEnvironment(shaderc_target_env_opengl, 0);
 
     shaderc::PreprocessedSourceCompilationResult preprocessing_result = compiler.PreprocessGlsl(
         src_code.data(), src_code.size(), shader_kind_sc, input_filename.data(), compile_options);
@@ -169,11 +206,6 @@ compile_shader_from_memory(const GLenum shader_kind_gl,
             g_logger, "Shader {} preprocessing failure:\n{}", input_filename, preprocessing_result.GetErrorMessage());
         return 0;
     }
-
-    compile_options.SetOptimizationLevel(optimize ? shaderc_optimization_level_performance
-                                                  : shaderc_optimization_level_zero);
-    compile_options.SetTargetEnvironment(shaderc_target_env_opengl, shaderc_env_version_opengl_4_5);
-    compile_options.SetTargetSpirv(shaderc_spirv_version_1_0);
 
     const string_view preprocessed_source{ preprocessing_result.begin(), preprocessing_result.end() };
 
@@ -186,33 +218,28 @@ compile_shader_from_memory(const GLenum shader_kind_gl,
                                                                                  compile_options);
 
     if (compilation_result.GetCompilationStatus() != shaderc_compilation_status_success) {
-        LOG_ERROR(
-            g_logger, "Shader {} compilation failure:\n{}", input_filename, preprocessing_result.GetErrorMessage());
+        LOG_ERROR(g_logger,
+                  "Shader [[ {} ]] compilation:: {} error(s)\n{}",
+                  input_filename,
+                  compilation_result.GetNumErrors(),
+                  compilation_result.GetErrorMessage());
         return 0;
     }
 
+    const GLsizeiptr spv_bytes_size =
+        static_cast<GLsizeiptr>(distance(compilation_result.begin(), compilation_result.end())) *
+        static_cast<GLsizeiptr>(sizeof(uint32_t));
+
     const GLuint shader_handle{ glCreateShader(shader_kind_gl) };
-    glShaderBinary(1,
-                   &shader_handle,
-                   GL_SHADER_BINARY_FORMAT_SPIR_V_ARB,
-                   compilation_result.cbegin(),
-                   static_cast<GLsizei>(distance(compilation_result.begin(), compilation_result.end())));
+    glShaderBinary(1, &shader_handle, GL_SHADER_BINARY_FORMAT_SPIR_V_ARB, compilation_result.cbegin(), spv_bytes_size);
     glSpecializeShaderARB(shader_handle, entry_point.data(), 0, nullptr, nullptr);
 
     GLint compile_status{};
     glGetShaderiv(shader_handle, GL_COMPILE_STATUS, &compile_status);
 
-    char temp_buff[1024];
     if (compile_status != GL_TRUE) {
-        GLsizei log_size{};
-        glGetShaderiv(shader_handle, GL_INFO_LOG_LENGTH, &log_size);
-        if (log_size > 0) {
-            GLsizei buff_size = std::min<GLsizei>(size(temp_buff), log_size);
-            glGetShaderInfoLog(shader_handle, buff_size, &log_size, temp_buff);
-            temp_buff[log_size] = 0;
-            LOG_ERROR(g_logger, "GL shader compile error:\n{}", temp_buff);
-        }
-
+        print_log_tag<shader_log_tag>(shader_handle);
+        glDeleteShader(shader_handle);
         return 0;
     }
 
@@ -224,18 +251,14 @@ compile_shader_from_memory(const GLenum shader_kind_gl,
     GLint link_status{};
     glGetProgramiv(program_handle, GL_LINK_STATUS, &link_status);
     if (link_status != GL_TRUE) {
-        GLsizei log_size{};
-        glGetProgramiv(program_handle, GL_INFO_LOG_LENGTH, &log_size);
-        if (log_size > 0) {
-            GLsizei buff_size = std::min<GLsizei>(size(temp_buff), log_size);
-            glGetProgramInfoLog(program_handle, buff_size, &log_size, temp_buff);
-            temp_buff[log_size] = 0;
-            LOG_ERROR(g_logger, "GL program error:\n{}", temp_buff);
-        }
+        print_log_tag<program_log_tag>(program_handle);
     }
 
     glDetachShader(program_handle, shader_handle);
     glDeleteShader(shader_handle);
+
+    if (!link_status)
+        glDeleteProgram(program_handle);
 
     return program_handle;
 }
@@ -284,12 +307,11 @@ gl_debug_callback(GLenum source,
 
 template<typename sdl_function, typename... sdl_func_args>
 auto
-sdl_func_call(const char* sdl_function_name,
-              sdl_function function,
-              sdl_func_args&&... func_args) -> std::invoke_result_t<sdl_function, sdl_func_args&&...>
+sdl_func_call(const char* sdl_function_name, sdl_function function, sdl_func_args&&... func_args)
+    -> std::invoke_result_t<sdl_function, sdl_func_args&&...>
 {
     if constexpr (std::is_same_v<std::invoke_result_t<sdl_function, sdl_func_args&&...>, void>) {
-        std::invoke(function, std::forward<sdl_func_args>(func_args)...);
+        std::invoke(function, std::forward<sdl_func_args&&>(func_args)...);
     } else {
         const auto func_result = std::invoke(function, std::forward<sdl_func_args&&>(func_args)...);
         if (!func_result) {
@@ -379,12 +401,12 @@ main(int, char**)
             switch (fmt) {
                 case GL_SHADER_BINARY_FORMAT_SPIR_V_ARB: {
                     auto res =
-                        fmt::format_to(tmp_buff, "{} {:0x}", PL_STRINGIZE(GL_SHADER_BINARY_FORMAT_SPIR_V_ARB), fmt);
+                        fmt::format_to(tmp_buff, "{} {:#x}", PL_STRINGIZE(GL_SHADER_BINARY_FORMAT_SPIR_V_ARB), fmt);
                     *res.out = 0;
                 } break;
 
                 default: {
-                    auto res = fmt::format_to(tmp_buff, "Unknown {:0x}", fmt);
+                    auto res = fmt::format_to(tmp_buff, "Unknown {:#x}", fmt);
                     *res.out = 0;
                 } break;
             }

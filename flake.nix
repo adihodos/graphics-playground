@@ -26,6 +26,7 @@
             [
               clang-tools
               cmake
+              cmake-format
               codespell
               conan
               cppcheck

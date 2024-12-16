@@ -1,17 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(playground LANGUAGES CXX)
+project(playground LANGUAGES C CXX)
 
-include(FetchContent)
+include(cmake/CPM.cmake)
 
-set(BUILD_EXAMPLES
-    OFF
-    CACHE INTERNAL "")
-set(BUILD_SHARED_LIBS
-    OFF
-    CACHE INTERNAL "")
-set(BUILD_TESTS
-    OFF
-    CACHE INTERNAL "")
 set(CMAKE_EXPORT_COMPILE_COMMANDS "ON")
 
 # FetchContent_Declare(libconfig GIT_REPOSITORY
@@ -22,40 +13,64 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS "ON")
 # FetchContent_Declare( serdepp GIT_REPOSITORY https://github.com/injae/serdepp
 # GIT_TAG "origin/main") FetchContent_MakeAvailable(serdepp)
 
-FetchContent_Declare(
-  sdl3
-  GIT_REPOSITORY https://github.com/libsdl-org/SDL
-  GIT_TAG "origin/main")
-FetchContent_MakeAvailable(sdl3)
-
-FetchContent_Declare(
-  fmt
-  GIT_REPOSITORY https://github.com/fmtlib/fmt
-  GIT_TAG "11.0.2")
-FetchContent_MakeAvailable(fmt)
-
-FetchContent_Declare(
-  quill
-  GIT_REPOSITORY https://github.com/odygrd/quill
-  GIT_TAG "v7.5.0")
-FetchContent_MakeAvailable(quill)
-
 find_package(Vulkan REQUIRED COMPONENTS glslang shaderc_combined)
 
-# include(FetchContent) FetchContent_Declare( tomlplusplus GIT_REPOSITORY
-# https://github.com/marzer/tomlplusplus.git GIT_TAG v3.2.0)
+cpmaddpackage("gh:libsdl-org/SDL#main")
+cpmaddpackage("gh:fmtlib/fmt#11.0.2")
+cpmaddpackage("gh:odygrd/quill@7.5.0")
+cpmaddpackage("gh:g-truc/glm#bf71a834948186f4097caa076cd2663c69a10e1e")
+cpmaddpackage("gh:TartanLlama/expected@1.1.0")
+cpmaddpackage("gh:TartanLlama/optional@1.1.0")
 
-# FetchContent_MakeAvailable(tomlplusplus)
+add_subdirectory(third_party/stb)
+add_subdirectory(third_party/tinygltf)
+
+set(nk_files "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuklear/nuklear.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuklear/nuklear.c")
+add_library(nuklear STATIC ${nk_files})
+
+target_include_directories(
+  nuklear PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuklear")
+
+target_compile_definitions(
+  nuklear
+  PUBLIC NK_INCLUDE_FIXED_TYPES
+         NK_INCLUDE_STANDARD_IO
+         NK_INCLUDE_STANDARD_VARARGS
+         NK_INCLUDE_DEFAULT_ALLOCATOR
+         NK_INCLUDE_VERTEX_BUFFER_OUTPUT
+         NK_INCLUDE_FONT_BAKING
+         NK_INCLUDE_DEFAULT_FONT
+         NK_UINT_DRAW_INDEX)
+
+add_custom_target(
+  copy_data ALL
+  COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/data
+          ${CMAKE_BINARY_DIR}/data
+  COMMENT "copy data directory"
+  VERBATIM)
 
 set(SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/small_vector.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/small_vector.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/glad.cc)
+
 add_executable(${CMAKE_PROJECT_NAME} ${SOURCE_FILES})
+add_dependencies(${CMAKE_PROJECT_NAME} copy_data)
+
 target_include_directories(${CMAKE_PROJECT_NAME}
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(${CMAKE_PROJECT_NAME} PRIVATE cxx_std_20)
 target_link_libraries(
-  ${CMAKE_PROJECT_NAME} PRIVATE SDL3::SDL3-static Vulkan::shaderc_combined
-                                fmt::fmt quill::quill)
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE SDL3::SDL3-static
+          Vulkan::shaderc_combined
+          fmt::fmt
+          quill::quill
+          glm::glm
+          tl::expected
+          tl::optional
+          stb
+          nuklear
+          tinygltf)

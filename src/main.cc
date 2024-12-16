@@ -9,7 +9,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <optional>
 #include <span>
 #include <system_error>
 #include <thread>
@@ -33,8 +32,25 @@
 #include <quill/LogMacros.h>
 #include <quill/Logger.h>
 #include <quill/sinks/ConsoleSink.h>
+#include <quill/std/Vector.h>
 
 #include <shaderc/shaderc.hpp>
+
+#include <tl/expected.hpp>
+#include <tl/optional.hpp>
+
+#include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
+#include <glm/mat4x4.hpp>
+#include <glm/ext/matrix_transform.hpp>
+#include <glm/ext/matrix_projection.hpp>
+#include <glm/ext/matrix_clip_space.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <glm/gtx/quaternion.hpp>
+
+#include <stb_image.h>
+#include <nuklear.h>
+#include <tiny_gltf.h>
 
 #define PL_STRINGIZE(x) #x
 
@@ -44,85 +60,100 @@ using fn::operators::operator%=;
 
 using namespace std;
 
-template<typename T>
-concept HasResizeAndClear = requires(T a) {
-    a.resize(size_t{});
-    a.clear();
-};
+quill::Logger* g_logger{};
 
-// template<HasResizeAndClear MyContainer>
-// void
-// apply_to_cont(MyContainer& c, size_t new_size)
-// {
-//   c.clear();
-//   c.resize(new_size);
-// }
-//
-
-// template<typename Container>
-//   requires HasResizeAndClear<Container>
-// void
-// apply_to_cont(Container& c, size_t new_size)
-// {
-//   c.clear();
-//   c.resize(1024);
-// }
-
-// template<typename Container>
-// void
-// apply_to_cont(Container& c, size_t new_size)
-//   requires HasResizeAndClear<Container>
-// {
-//   c.clear();
-//   c.resize(new_size);
-// }
-//
-
-template<typename Cont>
-concept HasResizeWithClean = requires(Cont c) {
-    c.clear();
-    c.resize(size_t{});
-};
-
-template<typename... Containers>
-void
-resize_and_clear(size_t size, Containers&&... c)
-    requires(HasResizeWithClean<Containers> && ...)
+struct DrawParams
 {
-    // auto fn_apply = [size](auto x) {
-    // 	cout << "\napplying";
-    // 	x.resize(size);
-    // 	x.clear();
-    // };
-    //
-    // (fn_apply(c), ...);
-    //(([size](auto x) { c.resize(size); c.clear(); }), ...);
+    int32_t surface_width;
+    int32_t surface_height;
+    int32_t display_width;
+    int32_t display_height;
+};
 
-    (
-        [size](auto x) {
-            cout << "\nApplying ...";
-            x.resize(size);
-            x.clear();
-        }(std::forward<Containers>(c)),
-        ...);
+struct UIContext
+{
+    struct nk_context* ctx;
+};
+
+struct OpenGLError
+{
+    GLenum error_code;
+};
+
+struct ShadercError
+{
+    std::string message;
+};
+
+struct SystemError
+{
+    std::error_code e;
+};
+
+using GenericProgramError = std::variant<std::monostate, OpenGLError, ShadercError, SystemError>;
+
+template<typename error_func, typename called_function, typename... called_func_args>
+auto
+func_call_wrapper(const char* function_name,
+                  error_func err_func,
+                  called_function function,
+                  called_func_args&&... func_args) -> std::invoke_result_t<called_function, called_func_args&&...>
+    requires std::is_invocable_v<decltype(err_func)>
+{
+    if constexpr (std::is_same_v<std::invoke_result_t<called_function, called_func_args&&...>, void>) {
+        std::invoke(function, std::forward<called_func_args&&>(func_args)...);
+    } else {
+        const auto func_result = std::invoke(function, std::forward<called_func_args&&>(func_args)...);
+        if (!func_result) {
+            LOG_ERROR(g_logger, "{} error: {}", function_name, err_func());
+        }
+        return func_result;
+    }
 }
 
-quill::Logger* g_logger{};
+#define CHECKED_SDL(sdl_func, ...) func_call_wrapper(PL_STRINGIZE(sdl_func), SDL_GetError, sdl_func, ##__VA_ARGS__)
+#define CHECKED_OPENGL(opengl_func, ...)                                                                               \
+    func_call_wrapper(PL_STRINGIZE(opengl_func), glGetError, opengl_func, ##__VA_ARGS__)
+
+template<typename T>
+tuple<GLenum, uint32_t, bool>
+vertex_array_attrib_from_type()
+{
+    if constexpr (is_same_v<T, glm::vec2> || is_same_v<remove_cvref_t<T>, float[2]>) {
+        return { GL_FLOAT, 2, false };
+    } else if constexpr (is_same_v<T, glm::vec3> || is_same_v<remove_cvref_t<T>, float[3]>) {
+        return { GL_FLOAT, 3, false };
+    } else if constexpr (is_same_v<T, glm::vec4> || is_same_v<remove_cvref_t<T>, float[4]>) {
+        return { GL_FLOAT, 4, false };
+    } else if constexpr (is_same_v<remove_cvref_t<T>, nk_byte[4]>) {
+        return { GL_UNSIGNED_BYTE, 4, true };
+    }
+}
+
+template<typename T>
+void
+vertex_array_append_attrib(const GLuint vao, const uint32_t idx, const uint32_t offset)
+{
+    glEnableVertexArrayAttrib(vao, idx);
+    const auto [attr_type, attr_count, attr_normalized] = vertex_array_attrib_from_type<T>();
+    glVertexArrayAttribFormat(vao, idx, attr_count, attr_type, attr_normalized, offset);
+    glVertexArrayAttribBinding(vao, idx, 0);
+}
 
 using glsl_preprocessor_define = pair<string_view, string_view>;
 
-optional<pair<GLenum, shaderc_shader_kind>>
+tl::expected<pair<GLenum, shaderc_shader_kind>, SystemError>
 classify_shader_file(const filesystem::path& fspath)
 {
     assert(fspath.has_extension());
 
     const filesystem::path ext = fspath.extension();
     if (ext == ".vert")
-        return optional{ pair{ GL_VERTEX_SHADER, shaderc_vertex_shader } };
+        return { pair{ GL_VERTEX_SHADER, shaderc_vertex_shader } };
     if (ext == ".frag")
-        return optional{ pair{ GL_FRAGMENT_SHADER, shaderc_fragment_shader } };
+        return { pair{ GL_FRAGMENT_SHADER, shaderc_fragment_shader } };
 
-    return nullopt;
+    return tl::make_unexpected(SystemError{ make_error_code(errc::not_supported) });
 }
 
 struct shader_log_tag
@@ -156,20 +187,18 @@ print_log_tag(const GLuint obj)
     }
 
     temp_buff[log_size] = 0;
-    LOG_ERROR(g_logger, "program|shader {} error:\n{}", obj, temp_buff);
+    LOG_ERROR(g_logger, "[program|shader] {} error:\n{}", obj, temp_buff);
 }
 
-GLuint
-compile_shader_from_memory(const GLenum shader_kind_gl,
-                           const shaderc_shader_kind shader_kind_sc,
-                           const string_view input_filename,
-                           const string_view src_code,
-                           const string_view entry_point,
-                           const span<const glsl_preprocessor_define> preprocessor_defines,
-                           const bool optimize = false)
+tl::expected<GLuint, GenericProgramError>
+create_gpu_program_from_memory(const GLenum shader_kind_gl,
+                               const shaderc_shader_kind shader_kind_sc,
+                               const string_view input_filename,
+                               const string_view src_code,
+                               const string_view entry_point,
+                               const span<const glsl_preprocessor_define> preprocessor_defines,
+                               const bool optimize = false)
 {
-    //
-    // preprocess
     shaderc::Compiler compiler{};
     shaderc::CompileOptions compile_options{};
 
@@ -178,22 +207,6 @@ compile_shader_from_memory(const GLenum shader_kind_gl,
             macro_name.data(), macro_name.length(), macro_val.data(), macro_val.length());
     }
 
-    // const shaderc_shader_kind shader_kind = [](const GLenum gl_shader_kind) {
-    //   switch (gl_shader_kind) {
-    //     case GL_VERTEX_SHADER:
-    //       return shaderc_vertex_shader;
-    //       break;
-    //
-    //     case GL_FRAGMENT_SHADER:
-    //       return shaderc_fragment_shader;
-    //       break;
-    //
-    //     default:
-    //       assert(false && "Unsupported shader kind");
-    //       return shaderc_vertex_shader;
-    //       break;
-    //   }
-    // }(shader_type);
     compile_options.SetOptimizationLevel(optimize ? shaderc_optimization_level_performance
                                                   : shaderc_optimization_level_zero);
     compile_options.SetTargetEnvironment(shaderc_target_env_opengl, 0);
@@ -204,11 +217,10 @@ compile_shader_from_memory(const GLenum shader_kind_gl,
     if (preprocessing_result.GetCompilationStatus() != shaderc_compilation_status_success) {
         LOG_ERROR(
             g_logger, "Shader {} preprocessing failure:\n{}", input_filename, preprocessing_result.GetErrorMessage());
-        return 0;
+        return tl::make_unexpected(ShadercError{ preprocessing_result.GetErrorMessage() });
     }
 
     const string_view preprocessed_source{ preprocessing_result.begin(), preprocessing_result.end() };
-
     LOG_INFO(g_logger, "Preprocessed shader:\n{}", preprocessed_source);
 
     shaderc::SpvCompilationResult compilation_result = compiler.CompileGlslToSpv(preprocessed_source.data(),
@@ -223,16 +235,19 @@ compile_shader_from_memory(const GLenum shader_kind_gl,
                   input_filename,
                   compilation_result.GetNumErrors(),
                   compilation_result.GetErrorMessage());
-        return 0;
+        return tl::make_unexpected(ShadercError{ compilation_result.GetErrorMessage() });
     }
 
-    const GLsizeiptr spv_bytes_size =
-        static_cast<GLsizeiptr>(distance(compilation_result.begin(), compilation_result.end())) *
-        static_cast<GLsizeiptr>(sizeof(uint32_t));
+    span<const uint32_t> spirv_bytecode{ compilation_result.begin(),
+                                         static_cast<size_t>(compilation_result.end() - compilation_result.begin()) };
 
     const GLuint shader_handle{ glCreateShader(shader_kind_gl) };
-    glShaderBinary(1, &shader_handle, GL_SHADER_BINARY_FORMAT_SPIR_V_ARB, compilation_result.cbegin(), spv_bytes_size);
-    glSpecializeShaderARB(shader_handle, entry_point.data(), 0, nullptr, nullptr);
+    glShaderBinary(1,
+                   &shader_handle,
+                   GL_SHADER_BINARY_FORMAT_SPIR_V,
+                   spirv_bytecode.data(),
+                   static_cast<GLsizei>(spirv_bytecode.size_bytes()));
+    glSpecializeShader(shader_handle, entry_point.data(), 0, nullptr, nullptr);
 
     GLint compile_status{};
     glGetShaderiv(shader_handle, GL_COMPILE_STATUS, &compile_status);
@@ -240,7 +255,7 @@ compile_shader_from_memory(const GLenum shader_kind_gl,
     if (compile_status != GL_TRUE) {
         print_log_tag<shader_log_tag>(shader_handle);
         glDeleteShader(shader_handle);
-        return 0;
+        return tl::make_unexpected(OpenGLError{ glGetError() });
     }
 
     const GLuint program_handle{ glCreateProgram() };
@@ -257,23 +272,25 @@ compile_shader_from_memory(const GLenum shader_kind_gl,
     glDetachShader(program_handle, shader_handle);
     glDeleteShader(shader_handle);
 
-    if (!link_status)
+    if (!link_status) {
         glDeleteProgram(program_handle);
+        return tl::make_unexpected(OpenGLError{ glGetError() });
+    }
 
     return program_handle;
 }
 
-GLuint
-compile_shader_from_file(const filesystem::path& source_file,
-                         const string_view entry_point,
-                         const span<const glsl_preprocessor_define> preprocessor_defines,
-                         const bool optimize = false)
+tl::expected<GLuint, GenericProgramError>
+create_gpu_program_from_file(const filesystem::path& source_file,
+                             const string_view entry_point,
+                             const span<const glsl_preprocessor_define> preprocessor_defines,
+                             const bool optimize = false)
 {
     error_code e{};
     const auto file_size = filesystem::file_size(source_file, e);
     if (e) {
         LOG_ERROR(g_logger, "FS error {}", e.message());
-        return 0;
+        return tl::make_unexpected(SystemError{ e });
     }
 
     string shader_code{};
@@ -282,16 +299,19 @@ compile_shader_from_file(const filesystem::path& source_file,
     ifstream f{ source_file };
     if (!f) {
         LOG_ERROR(g_logger, "Can't open file {}", source_file.string());
-        return 0;
+        return tl::make_unexpected(SystemError{ make_error_code(errc::io_error) });
     }
 
     shader_code.assign(istreambuf_iterator<char>{ f }, istreambuf_iterator<char>{});
 
-    const auto [shader_kind_gl, shader_kind_shaderc] = *classify_shader_file(source_file);
-
-    return compile_shader_from_memory(
-        shader_kind_gl, shader_kind_shaderc, source_file.string(), shader_code, "main", preprocessor_defines);
+    return classify_shader_file(source_file).and_then([&](auto p) {
+        const auto [shader_kind_gl, shader_kind_shaderc] = p;
+        return create_gpu_program_from_memory(
+            shader_kind_gl, shader_kind_shaderc, source_file.string(), shader_code, entry_point, preprocessor_defines);
+    });
 }
+
+char monka_mega_scratch_msg_buffer[4 * 1024 * 1024];
 
 void
 gl_debug_callback(GLenum source,
@@ -302,43 +322,982 @@ gl_debug_callback(GLenum source,
                   const GLchar* message,
                   const void* userParam)
 {
-    LOG_DEBUG(g_logger, "GL: {}", message);
-}
+    const char* dbg_src_desc = [source]() {
+        switch (source) {
+            case GL_DEBUG_SOURCE_API:
+                return "OpenGL API";
+                break;
 
-template<typename sdl_function, typename... sdl_func_args>
-auto
-sdl_func_call(const char* sdl_function_name, sdl_function function, sdl_func_args&&... func_args)
-    -> std::invoke_result_t<sdl_function, sdl_func_args&&...>
-{
-    if constexpr (std::is_same_v<std::invoke_result_t<sdl_function, sdl_func_args&&...>, void>) {
-        std::invoke(function, std::forward<sdl_func_args&&>(func_args)...);
-    } else {
-        const auto func_result = std::invoke(function, std::forward<sdl_func_args&&>(func_args)...);
-        if (!func_result) {
-            LOG_ERROR(g_logger, "{} error: {}", sdl_function_name, SDL_GetError());
+            case GL_DEBUG_SOURCE_SHADER_COMPILER:
+                return "OpenGL Shader Compiler";
+                break;
+
+            case GL_DEBUG_SOURCE_WINDOW_SYSTEM:
+                return "Windowing system";
+                break;
+
+            case GL_DEBUG_SOURCE_THIRD_PARTY:
+                return "Third party";
+                break;
+
+            case GL_DEBUG_SOURCE_APPLICATION:
+                return "Application";
+                break;
+
+            case GL_DEBUG_SOURCE_OTHER:
+            default:
+                return "Other";
         }
-        return func_result;
+    }();
+
+#define DESC_TABLE_ENTRY(glid, desc)                                                                                   \
+    case glid:                                                                                                         \
+        return desc;                                                                                                   \
+        break
+
+    const char* msg_type_desc = [type]() {
+        switch (type) {
+            DESC_TABLE_ENTRY(GL_DEBUG_TYPE_ERROR, "error");
+            DESC_TABLE_ENTRY(GL_DEBUG_TYPE_DEPRECATED_BEHAVIOR, "deprecated behavior");
+            DESC_TABLE_ENTRY(GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR, "undefined behavior");
+            DESC_TABLE_ENTRY(GL_DEBUG_TYPE_PERFORMANCE, "performance");
+            DESC_TABLE_ENTRY(GL_DEBUG_TYPE_PORTABILITY, "portability");
+            DESC_TABLE_ENTRY(GL_DEBUG_TYPE_MARKER, "marker");
+            DESC_TABLE_ENTRY(GL_DEBUG_TYPE_PUSH_GROUP, "push group");
+            DESC_TABLE_ENTRY(GL_DEBUG_TYPE_POP_GROUP, "pop group");
+            DESC_TABLE_ENTRY(GL_DEBUG_TYPE_OTHER, "other");
+            default:
+                return "other";
+                break;
+        }
+    }();
+
+    const char* severity_desc = [severity]() {
+        switch (severity) {
+            DESC_TABLE_ENTRY(GL_DEBUG_SEVERITY_HIGH, "high");
+            DESC_TABLE_ENTRY(GL_DEBUG_SEVERITY_MEDIUM, "medium");
+            DESC_TABLE_ENTRY(GL_DEBUG_SEVERITY_LOW, "low");
+            DESC_TABLE_ENTRY(GL_DEBUG_SEVERITY_NOTIFICATION, "notification");
+            default:
+                return "unknown";
+                break;
+        }
+    }();
+
+    auto result = fmt::format_to(monka_mega_scratch_msg_buffer,
+                                 "[OpenGL debug]\nsource: {}\ntype: {}\nid {}({:#0x})\n{}",
+                                 dbg_src_desc,
+                                 msg_type_desc,
+                                 id,
+                                 id,
+                                 message ? message : "no message");
+    *result.out = 0;
+
+    if (severity == GL_DEBUG_SEVERITY_HIGH || severity == GL_DEBUG_SEVERITY_MEDIUM) {
+        LOG_ERROR(g_logger, "{}", monka_mega_scratch_msg_buffer);
+    } else {
+        LOG_DEBUG(g_logger, "{}", monka_mega_scratch_msg_buffer);
     }
 }
 
-#define SDL_FUNC_CALL(sdl_func, ...) sdl_func_call(#sdl_func, sdl_func, ##__VA_ARGS__)
+struct BufferMapping
+{
+    GLuint handle;
+    GLintptr offset;
+    GLsizei length;
+    void* mapped_addr;
+
+    static tl::expected<BufferMapping, OpenGLError> create(const GLuint buffer,
+                                                           const GLintptr offset,
+                                                           const GLbitfield access,
+                                                           const GLsizei mapping_len = 0);
+
+    BufferMapping(const BufferMapping&) = delete;
+    BufferMapping& operator=(const BufferMapping&) = delete;
+
+    BufferMapping(const GLuint buf, const GLintptr off, const GLsizei len, void* mem) noexcept
+        : handle{ buf }
+        , offset{ off }
+        , length{ len }
+        , mapped_addr{ mem }
+    {
+    }
+
+    ~BufferMapping()
+    {
+        if (mapped_addr) {
+            // CHECKED_OPENGL(glFlushMappedNamedBufferRange, handle, offset, length);
+            CHECKED_OPENGL(glUnmapNamedBuffer, handle);
+        }
+    }
+
+    BufferMapping(BufferMapping&& rhs) noexcept
+    {
+        memcpy(this, &rhs, sizeof(*this));
+        memset(&rhs, 0, sizeof(rhs));
+    }
+};
+
+tl::expected<BufferMapping, OpenGLError>
+BufferMapping::create(const GLuint buffer, const GLintptr offset, const GLbitfield access, const GLsizei mapping_len)
+{
+    GLsizei maplength{ mapping_len };
+    if (maplength == 0) {
+        glGetNamedBufferParameteriv(buffer, GL_BUFFER_SIZE, &maplength);
+    }
+
+    void* mapped_addr = CHECKED_OPENGL(glMapNamedBufferRange, buffer, offset, maplength, access);
+    if (!mapped_addr) {
+        return tl::unexpected{ OpenGLError{ glGetError() } };
+    }
+
+    return tl::expected<BufferMapping, OpenGLError>{ BufferMapping{ buffer, offset, maplength, mapped_addr } };
+}
+
+struct Texture
+{
+    GLuint handle{};
+    GLenum internal_fmt{};
+    int32_t width{};
+    int32_t height{};
+    int32_t depth{ 1 };
+
+    static tl::expected<Texture, GenericProgramError> from_file(const filesystem::path& path);
+    static tl::expected<Texture, GenericProgramError> from_memory(
+        const void* pixels,
+        const int32_t width,
+        const int32_t height,
+        const int32_t channels,
+        const tl::optional<uint32_t> mip_levels = tl::nullopt);
+
+    void release() noexcept
+    {
+        if (handle)
+            glDeleteTextures(1, &handle);
+    }
+};
+
+tl::expected<Texture, GenericProgramError>
+Texture::from_memory(const void* pixels,
+                     const int32_t width,
+                     const int32_t height,
+                     const int32_t channels,
+                     const tl::optional<uint32_t> mip_levels)
+{
+    constexpr const pair<GLenum, GLenum> gl_format_pairs[] = {
+        { GL_R8, GL_RED }, { GL_RG8, GL_RG }, { GL_RGB8, GL_RGB }, { GL_RGBA8, GL_RGBA }
+    };
+    assert(channels >= 1 && channels <= 4);
+
+    Texture texture{};
+    texture.internal_fmt = gl_format_pairs[channels - 1].first;
+    texture.width = width;
+    texture.height = height;
+
+    glCreateTextures(GL_TEXTURE_2D, 1, &texture.handle);
+    glTextureStorage2D(texture.handle, mip_levels.value_or(1), texture.internal_fmt, width, height);
+    glTextureSubImage2D(
+        texture.handle, 0, 0, 0, width, height, gl_format_pairs[channels - 1].second, GL_UNSIGNED_BYTE, pixels);
+
+    mip_levels.map([texid = texture.handle](const uint32_t) { glGenerateTextureMipmap(texid); });
+
+    return tl::expected<Texture, GenericProgramError>{ texture };
+}
+
+tl::expected<Texture, GenericProgramError>
+Texture::from_file(const filesystem::path& path)
+{
+    const string s_path = path.string();
+    int32_t width{};
+    int32_t height{};
+    int32_t channels{};
+
+    unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels{ stbi_load(s_path.c_str(), &width, &height, &channels, 0),
+                                                            &stbi_image_free };
+
+    if (!pixels) {
+        return tl::make_unexpected(SystemError{ make_error_code(errc::io_error) });
+    }
+
+    return from_memory(pixels.get(), width, height, channels, tl::optional<uint32_t>{ 8 });
+}
+
+struct nk_sdl_vertex
+{
+    float position[2];
+    float uv[2];
+    nk_byte col[4];
+};
+
+struct BackendUI
+{
+    SDL_Window* window{};
+    struct UIDeviceData
+    {
+        nk_buffer cmds;
+        nk_draw_null_texture tex_null;
+        GLuint buffers[3]{}; // vertex + index + uniform
+        GLuint vao{};
+        GLuint gpu_programs[2]{};
+        GLuint prog_pipeline{};
+        Texture font_atlas{};
+        GLuint sampler;
+    } gl_state{};
+    nk_context ctx;
+    nk_font_atlas atlas;
+    nk_font* default_font{};
+    uint64_t time_of_last_frame;
+
+    static constexpr const uint32_t MAX_VERTICES = 8192;
+    static constexpr const uint32_t MAX_INDICES = 65535;
+
+    BackendUI()
+    {
+        nk_buffer_init_default(&gl_state.cmds);
+        nk_init_default(&ctx, nullptr);
+        nk_font_atlas_init_default(&atlas);
+    }
+
+    ~BackendUI();
+
+    BackendUI(const BackendUI&) = delete;
+    BackendUI& operator=(const BackendUI&) = delete;
+
+    BackendUI(BackendUI&& rhs) noexcept
+    {
+        memcpy(this, &rhs, sizeof(*this));
+        rhs.window = nullptr;
+        memset(&rhs.gl_state, 0, sizeof(rhs.gl_state));
+        nk_buffer_init_default(&rhs.gl_state.cmds);
+        nk_init_default(&rhs.ctx, nullptr);
+        nk_font_atlas_init_default(&rhs.atlas);
+    }
+
+    static tl::expected<BackendUI, GenericProgramError> create(SDL_Window* win);
+    bool handle_event(const SDL_Event* e);
+
+    auto new_frame() -> UIContext { return UIContext{ .ctx = &ctx }; }
+    void input_begin() { nk_input_begin(&ctx); }
+    void input_end();
+    void render(const DrawParams& dp);
+};
+
+BackendUI::~BackendUI()
+{
+    gl_state.font_atlas.release();
+    glDeleteBuffers(size(gl_state.buffers), gl_state.buffers);
+    for (const auto prg : gl_state.gpu_programs) {
+        glDeleteProgram(prg);
+    }
+    glDeleteProgramPipelines(1, &gl_state.prog_pipeline);
+    glDeleteVertexArrays(1, &gl_state.vao);
+    glDeleteSamplers(1, &gl_state.sampler);
+
+    nk_buffer_free(&gl_state.cmds);
+    nk_font_atlas_clear(&atlas);
+
+    nk_free(&ctx);
+}
+
+tl::expected<BackendUI, GenericProgramError>
+BackendUI::create(SDL_Window* win)
+{
+    BackendUI backend;
+    backend.window = win;
+
+    UIDeviceData& dev = backend.gl_state;
+
+    const uint32_t buffer_sizes[] = { MAX_VERTICES * sizeof(nk_sdl_vertex), MAX_INDICES * sizeof(uint32_t), 1024 };
+    glCreateBuffers(size(dev.buffers), dev.buffers);
+    for (size_t idx = 0; idx < size(dev.buffers); ++idx) {
+        glNamedBufferStorage(dev.buffers[idx], buffer_sizes[idx], nullptr, GL_MAP_WRITE_BIT);
+    }
+
+    glCreateVertexArrays(1, &dev.vao);
+    vertex_array_append_attrib<decltype(nk_sdl_vertex{}.position)>(dev.vao, 0, offsetof(nk_sdl_vertex, position));
+    vertex_array_append_attrib<decltype(nk_sdl_vertex{}.uv)>(dev.vao, 1, offsetof(nk_sdl_vertex, uv));
+    vertex_array_append_attrib<decltype(nk_sdl_vertex{}.col)>(dev.vao, 2, offsetof(nk_sdl_vertex, col));
+
+    glVertexArrayVertexBuffer(dev.vao, 0, dev.buffers[0], 0, sizeof(nk_sdl_vertex));
+    glVertexArrayElementBuffer(dev.vao, dev.buffers[1]);
+
+    static constexpr const char* UI_VERTEX_SHADER = R"#(
+    #version 450 core
+    layout (location = 0) in vec2 pos;
+    layout (location = 1) in vec2 texcoord;
+    layout (location = 2) in vec4 color;
+
+    layout (binding = 0) uniform GlobalParams {
+        mat4 WorldViewProj;
+    };
+
+    layout (location = 0) out gl_PerVertex {
+        vec4 gl_Position;
+    };
+
+    layout (location = 0) out VS_OUT_FS_IN {
+        vec2 uv;
+        vec4 color;
+    } vs_out;
+
+    void main() {
+        vs_out.uv = texcoord;
+        vs_out.color = color;
+        gl_Position = WorldViewProj * vec4(pos, 0.0f, 1.0f);
+    }
+    )#";
+
+    constexpr const char* const UI_FRAGMENT_SHADER = R"#(
+    #version 450 core
+
+    layout (binding = 0) uniform sampler2D FontAtlas;
+    layout (location = 0) in VS_OUT_FS_IN {
+        vec2 uv;
+        vec4 color;
+    } fs_in;
+    layout (location = 0) out vec4 FinalFragColor;
+
+    void main() {
+        FinalFragColor = fs_in.color * texture(FontAtlas, fs_in.uv);
+    }
+    )#";
+
+    glCreateProgramPipelines(1, &dev.prog_pipeline);
+
+    constexpr const tuple<const char*, const char*, GLbitfield, GLenum, shaderc_shader_kind, const char*>
+        shader_create_data[] = { { UI_VERTEX_SHADER,
+                                   "main",
+                                   GL_VERTEX_SHADER_BIT,
+                                   GL_VERTEX_SHADER,
+                                   shaderc_vertex_shader,
+                                   "ui_vertex_shader" },
+                                 { UI_FRAGMENT_SHADER,
+                                   "main",
+                                   GL_FRAGMENT_SHADER_BIT,
+                                   GL_FRAGMENT_SHADER,
+                                   shaderc_fragment_shader,
+                                   "ui_fragment_shader" } };
+
+    size_t idx{};
+    for (auto [shader_code, entry_point, shader_stage, shader_type, shaderc_kind, shader_id] : shader_create_data) {
+        auto shader_prog =
+            create_gpu_program_from_memory(shader_type, shaderc_kind, shader_id, shader_code, entry_point, {});
+        if (!shader_prog)
+            return tl::make_unexpected(shader_prog.error());
+
+        dev.gpu_programs[idx++] = *shader_prog;
+        glUseProgramStages(dev.prog_pipeline, shader_stage, *shader_prog);
+    }
+
+    {
+        nk_font_atlas_begin(&backend.atlas);
+
+        nk_font* zed =
+            nk_font_atlas_add_from_file(&backend.atlas, "data/fonts/ZedMonoNerdFontMono-Medium.ttf", 20.0f, nullptr);
+
+        nk_font* default_font = zed;
+
+        /*struct nk_font *droid = nk_font_atlas_add_from_file(atlas, "../../../extra_font/DroidSans.ttf", 14, 0);*/
+        /*struct nk_font *roboto = nk_font_atlas_add_from_file(atlas, "../../../extra_font/Roboto-Regular.ttf", 16,
+         * 0);*/
+        /*struct nk_font *future = nk_font_atlas_add_from_file(atlas, "../../../extra_font/kenvector_future_thin.ttf",
+         * 13, 0);*/
+        /*struct nk_font *clean = nk_font_atlas_add_from_file(atlas, "../../../extra_font/ProggyClean.ttf", 12, 0);*/
+        /*struct nk_font *tiny = nk_font_atlas_add_from_file(atlas, "../../../extra_font/ProggyTiny.ttf", 10, 0);*/
+        /*struct nk_font *cousine = nk_font_atlas_add_from_file(atlas, "../../../extra_font/Cousine-Regular.ttf", 13,
+         * 0);*/
+        int atlas_width{}, atlas_height{};
+        const void* atlas_pixels =
+            nk_font_atlas_bake(&backend.atlas, &atlas_width, &atlas_height, NK_FONT_ATLAS_RGBA32);
+
+        auto maybe_texture = Texture::from_memory(atlas_pixels, atlas_width, atlas_height, 4);
+        if (!maybe_texture)
+            return tl::make_unexpected(maybe_texture.error());
+
+        backend.gl_state.font_atlas = *maybe_texture;
+        nk_font_atlas_end(
+            &backend.atlas, nk_handle_id((int)backend.gl_state.font_atlas.handle), &backend.gl_state.tex_null);
+
+        // if (backend.atlas.default_font)
+        //     nk_style_set_font(&backend.ctx, &backend.atlas.default_font->handle);
+        nk_style_set_font(&backend.ctx, &default_font->handle);
+
+        glCreateSamplers(1, &dev.sampler);
+        glSamplerParameteri(dev.sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glSamplerParameteri(dev.sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+
+    backend.time_of_last_frame = SDL_GetTicks();
+    return tl::expected<BackendUI, GenericProgramError>{ std::move(backend) };
+}
+
+bool
+BackendUI::handle_event(const SDL_Event* evt)
+{
+    struct nk_context* ctx = &this->ctx;
+
+    switch (evt->type) {
+        case SDL_EVENT_KEY_UP: /* KEYUP & KEYDOWN share same routine */
+        case SDL_EVENT_KEY_DOWN: {
+            const bool down = evt->type == SDL_EVENT_KEY_DOWN;
+            const bool* state = SDL_GetKeyboardState(0);
+            switch (evt->key.key) {
+                case SDLK_RSHIFT: /* RSHIFT & LSHIFT share same routine */
+                case SDLK_LSHIFT:
+                    nk_input_key(ctx, NK_KEY_SHIFT, down);
+                    break;
+                case SDLK_DELETE:
+                    nk_input_key(ctx, NK_KEY_DEL, down);
+                    break;
+                case SDLK_RETURN:
+                    nk_input_key(ctx, NK_KEY_ENTER, down);
+                    break;
+                case SDLK_TAB:
+                    nk_input_key(ctx, NK_KEY_TAB, down);
+                    break;
+                case SDLK_BACKSPACE:
+                    nk_input_key(ctx, NK_KEY_BACKSPACE, down);
+                    break;
+                case SDLK_HOME:
+                    nk_input_key(ctx, NK_KEY_TEXT_START, down);
+                    nk_input_key(ctx, NK_KEY_SCROLL_START, down);
+                    break;
+                case SDLK_END:
+                    nk_input_key(ctx, NK_KEY_TEXT_END, down);
+                    nk_input_key(ctx, NK_KEY_SCROLL_END, down);
+                    break;
+                case SDLK_PAGEDOWN:
+                    nk_input_key(ctx, NK_KEY_SCROLL_DOWN, down);
+                    break;
+                case SDLK_PAGEUP:
+                    nk_input_key(ctx, NK_KEY_SCROLL_UP, down);
+                    break;
+                case SDLK_Z:
+                    nk_input_key(ctx, NK_KEY_TEXT_UNDO, down && state[SDL_SCANCODE_LCTRL]);
+                    break;
+                case SDLK_R:
+                    nk_input_key(ctx, NK_KEY_TEXT_REDO, down && state[SDL_SCANCODE_LCTRL]);
+                    break;
+                case SDLK_C:
+                    nk_input_key(ctx, NK_KEY_COPY, down && state[SDL_SCANCODE_LCTRL]);
+                    break;
+                case SDLK_V:
+                    nk_input_key(ctx, NK_KEY_PASTE, down && state[SDL_SCANCODE_LCTRL]);
+                    break;
+                case SDLK_X:
+                    nk_input_key(ctx, NK_KEY_CUT, down && state[SDL_SCANCODE_LCTRL]);
+                    break;
+                case SDLK_B:
+                    nk_input_key(ctx, NK_KEY_TEXT_LINE_START, down && state[SDL_SCANCODE_LCTRL]);
+                    break;
+                case SDLK_E:
+                    nk_input_key(ctx, NK_KEY_TEXT_LINE_END, down && state[SDL_SCANCODE_LCTRL]);
+                    break;
+                case SDLK_UP:
+                    nk_input_key(ctx, NK_KEY_UP, down);
+                    break;
+                case SDLK_DOWN:
+                    nk_input_key(ctx, NK_KEY_DOWN, down);
+                    break;
+                case SDLK_LEFT:
+                    if (state[SDL_SCANCODE_LCTRL])
+                        nk_input_key(ctx, NK_KEY_TEXT_WORD_LEFT, down);
+                    else
+                        nk_input_key(ctx, NK_KEY_LEFT, down);
+                    break;
+                case SDLK_RIGHT:
+                    if (state[SDL_SCANCODE_LCTRL])
+                        nk_input_key(ctx, NK_KEY_TEXT_WORD_RIGHT, down);
+                    else
+                        nk_input_key(ctx, NK_KEY_RIGHT, down);
+                    break;
+            }
+        }
+            return true;
+
+        case SDL_EVENT_MOUSE_BUTTON_UP: /* MOUSEBUTTONUP & MOUSEBUTTONDOWN share same routine */
+        case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+            const bool down = evt->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+            const int x = evt->button.x, y = evt->button.y;
+            switch (evt->button.button) {
+                case SDL_BUTTON_LEFT:
+                    if (evt->button.clicks > 1)
+                        nk_input_button(ctx, NK_BUTTON_DOUBLE, x, y, down);
+                    nk_input_button(ctx, NK_BUTTON_LEFT, x, y, down);
+                    break;
+                case SDL_BUTTON_MIDDLE:
+                    nk_input_button(ctx, NK_BUTTON_MIDDLE, x, y, down);
+                    break;
+                case SDL_BUTTON_RIGHT:
+                    nk_input_button(ctx, NK_BUTTON_RIGHT, x, y, down);
+                    break;
+            }
+        }
+            return true;
+
+        case SDL_EVENT_MOUSE_MOTION:
+            if (ctx->input.mouse.grabbed) {
+                int x = (int)ctx->input.mouse.prev.x, y = (int)ctx->input.mouse.prev.y;
+                nk_input_motion(ctx, x + evt->motion.xrel, y + evt->motion.yrel);
+            } else
+                nk_input_motion(ctx, evt->motion.x, evt->motion.y);
+            return true;
+
+        case SDL_EVENT_TEXT_INPUT: {
+            nk_glyph glyph;
+            memcpy(glyph, evt->text.text, NK_UTF_SIZE);
+            nk_input_glyph(ctx, glyph);
+        }
+            return true;
+
+        case SDL_EVENT_MOUSE_WHEEL:
+            nk_input_scroll(ctx, nk_vec2((float)evt->wheel.x, (float)evt->wheel.y));
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+void
+BackendUI::render(const DrawParams& dp)
+{
+    UIDeviceData* dev = &this->gl_state;
+
+    const uint64_t now = SDL_GetTicks();
+    ctx.delta_time_seconds = (float)(now - time_of_last_frame) / 1000;
+    time_of_last_frame = now;
+    const struct nk_vec2 scale
+    {
+        1.0f, 1.0f
+    };
+
+    /* setup global state */
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_SCISSOR_TEST);
+
+    BufferMapping::create(dev->buffers[2], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)
+        .map([&dp](BufferMapping ubo) {
+            const glm::mat4 projection = glm::ortho(
+                0.0f, static_cast<float>(dp.surface_width), static_cast<float>(dp.surface_height), 0.0f, -1.0f, 1.0f);
+            memcpy(ubo.mapped_addr, &projection, sizeof(projection));
+        });
+
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, dev->buffers[2]);
+    glBindProgramPipeline(dev->prog_pipeline);
+    glBindVertexArray(dev->vao);
+    glBindSampler(0, dev->sampler);
+
+    {
+        //
+        // convert draw commands and fill vertex + index buffer
+        {
+            auto vertex_buffer =
+                BufferMapping::create(dev->buffers[0], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            auto index_buffer =
+                BufferMapping::create(dev->buffers[1], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+            assert(vertex_buffer && index_buffer);
+
+            static const struct nk_draw_vertex_layout_element vertex_layout[] = {
+                { NK_VERTEX_POSITION, NK_FORMAT_FLOAT, NK_OFFSETOF(struct nk_sdl_vertex, position) },
+                { NK_VERTEX_TEXCOORD, NK_FORMAT_FLOAT, NK_OFFSETOF(struct nk_sdl_vertex, uv) },
+                { NK_VERTEX_COLOR, NK_FORMAT_R8G8B8A8, NK_OFFSETOF(struct nk_sdl_vertex, col) },
+                { NK_VERTEX_LAYOUT_END }
+            };
+
+            nk_convert_config config{};
+            config.vertex_layout = vertex_layout;
+            config.vertex_size = sizeof(nk_sdl_vertex);
+            config.vertex_alignment = NK_ALIGNOF(struct nk_sdl_vertex);
+            config.tex_null = dev->tex_null;
+            config.circle_segment_count = 22;
+            config.curve_segment_count = 22;
+            config.arc_segment_count = 22;
+            config.global_alpha = 1.0f;
+            config.shape_AA = NK_ANTI_ALIASING_ON;
+            config.line_AA = NK_ANTI_ALIASING_ON;
+
+            /* setup buffers to load vertices and elements */
+            nk_buffer vbuf;
+            nk_buffer_init_fixed(
+                &vbuf, vertex_buffer->mapped_addr, (nk_size)BackendUI::MAX_VERTICES * sizeof(nk_sdl_vertex));
+
+            nk_buffer ebuf;
+            nk_buffer_init_fixed(&ebuf, index_buffer->mapped_addr, (nk_size)BackendUI::MAX_INDICES * sizeof(uint32_t));
+            nk_convert(&ctx, &dev->cmds, &vbuf, &ebuf, &config);
+        }
+
+        /* iterate over and execute each draw command */
+        const nk_draw_command* cmd;
+        const nk_draw_index* offset = nullptr;
+        nk_draw_foreach(cmd, &ctx, &dev->cmds)
+        {
+            if (!cmd->elem_count)
+                continue;
+
+            glBindTextureUnit(0, static_cast<GLuint>(cmd->texture.id));
+            LOG_INFO(g_logger, "texture id {}", cmd->texture.id);
+            glScissor((GLint)(cmd->clip_rect.x * scale.x),
+                      (GLint)((dp.surface_height - (GLint)(cmd->clip_rect.y + cmd->clip_rect.h)) * scale.y),
+                      (GLint)(cmd->clip_rect.w * scale.x),
+                      (GLint)(cmd->clip_rect.h * scale.y));
+            glDrawElements(GL_TRIANGLES, (GLsizei)cmd->elem_count, GL_UNSIGNED_INT, offset);
+            offset += cmd->elem_count;
+        }
+
+        nk_clear(&ctx);
+        nk_buffer_clear(&dev->cmds);
+    }
+
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_DEPTH_TEST);
+}
+
+void
+BackendUI::input_end()
+{
+    struct nk_context* pctx = &ctx;
+
+    if (pctx->input.mouse.grab) {
+        SDL_SetWindowRelativeMouseMode(window, true);
+    } else if (pctx->input.mouse.ungrab) {
+        /* better support for older SDL by setting mode first; causes an extra mouse motion event */
+        SDL_SetWindowRelativeMouseMode(window, false);
+        SDL_WarpMouseInWindow(window, (int)pctx->input.mouse.prev.x, (int)pctx->input.mouse.prev.y);
+    } else if (pctx->input.mouse.grabbed) {
+        pctx->input.mouse.pos.x = pctx->input.mouse.prev.x;
+        pctx->input.mouse.pos.y = pctx->input.mouse.prev.y;
+    }
+    nk_input_end(&ctx);
+}
+
+struct UniformBuffer
+{
+    glm::mat4 wvp;
+};
+
+struct TriangleDemo
+{
+    GLuint buffers[3];
+    GLuint vertex_array;
+    GLuint gpu_programs[2];
+    GLuint program_pipeline[1];
+    GLuint sampler;
+    Texture texture;
+
+    static tl::expected<TriangleDemo, GenericProgramError> create();
+
+    TriangleDemo(const TriangleDemo&) = delete;
+    TriangleDemo& operator=(const TriangleDemo&) = delete;
+
+    TriangleDemo() = default;
+    TriangleDemo(TriangleDemo&& rhs) noexcept
+    {
+        memcpy(this, &rhs, sizeof(*this));
+        memset(&rhs, 0, sizeof(*this));
+    }
+
+    ~TriangleDemo();
+
+    void ui(UIContext* ui);
+    void render(const DrawParams& dp);
+};
+
+void
+TriangleDemo::ui(UIContext* ui)
+{
+    struct nk_context* ctx = ui->ctx;
+    static nk_colorf bg{ .r = 0.10f, .g = 0.18f, .b = 0.24f, .a = 1.0f };
+
+    if (nk_begin(ctx,
+                 "Demo",
+                 nk_rect(50, 50, 230, 250),
+                 NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE | NK_WINDOW_MINIMIZABLE | NK_WINDOW_TITLE)) {
+        enum
+        {
+            EASY,
+            HARD
+        };
+        static int op = EASY;
+        static int property = 20;
+
+        nk_layout_row_static(ctx, 30, 80, 1);
+        if (nk_button_label(ctx, "button"))
+            printf("button pressed!\n");
+        nk_layout_row_dynamic(ctx, 30, 2);
+        if (nk_option_label(ctx, "easy", op == EASY))
+            op = EASY;
+        if (nk_option_label(ctx, "hard", op == HARD))
+            op = HARD;
+        nk_layout_row_dynamic(ctx, 22, 1);
+        nk_property_int(ctx, "Compression:", 0, &property, 100, 10, 1);
+
+        nk_layout_row_dynamic(ctx, 20, 1);
+        nk_label(ctx, "background:", NK_TEXT_LEFT);
+        nk_layout_row_dynamic(ctx, 25, 1);
+        if (nk_combo_begin_color(ctx, nk_rgb_cf(bg), nk_vec2(nk_widget_width(ctx), 400))) {
+            nk_layout_row_dynamic(ctx, 120, 1);
+            bg = nk_color_picker(ctx, bg, NK_RGBA);
+            nk_layout_row_dynamic(ctx, 25, 1);
+            bg.r = nk_propertyf(ctx, "#R:", 0, bg.r, 1.0f, 0.01f, 0.005f);
+            bg.g = nk_propertyf(ctx, "#G:", 0, bg.g, 1.0f, 0.01f, 0.005f);
+            bg.b = nk_propertyf(ctx, "#B:", 0, bg.b, 1.0f, 0.01f, 0.005f);
+            bg.a = nk_propertyf(ctx, "#A:", 0, bg.a, 1.0f, 0.01f, 0.005f);
+            nk_combo_end(ctx);
+        }
+    }
+    nk_end(ctx);
+}
+
+void
+TriangleDemo::render(const DrawParams& dp)
+{
+    const GLuint uniform_buffer = buffers[2];
+    BufferMapping::create(uniform_buffer, 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT).map([&](BufferMapping m) {
+        const glm::mat4 mtx = glm::identity<glm::mat4>();
+
+        memcpy(m.mapped_addr, &mtx, sizeof(mtx));
+    });
+
+    glBindVertexArray(vertex_array);
+    glBindProgramPipeline(this->program_pipeline[0]);
+    glBindBufferRange(GL_UNIFORM_BUFFER, 0, uniform_buffer, 0, 4096);
+    glBindTextureUnit(0, texture.handle);
+    glBindSampler(0, sampler);
+    glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_INT, nullptr);
+}
+
+TriangleDemo::~TriangleDemo()
+{
+    glDeleteBuffers(size(buffers), buffers);
+    glDeleteVertexArrays(1, &vertex_array);
+
+    for (const GLuint prog : gpu_programs)
+        glDeleteProgram(prog);
+
+    glDeleteProgramPipelines(size(program_pipeline), program_pipeline);
+    glDeleteSamplers(1, &sampler);
+    glDeleteTextures(1, &texture.handle);
+}
+
+struct VertexPCT
+{
+    glm::vec3 pos;
+    glm::vec4 color;
+    glm::vec2 uv;
+};
+
+tl::expected<TriangleDemo, GenericProgramError>
+TriangleDemo::create()
+{
+    TriangleDemo obj{};
+
+    glCreateBuffers(size(obj.buffers), obj.buffers);
+
+    glNamedBufferStorage(obj.buffers[0], 256 * sizeof(VertexPCT), nullptr, GL_MAP_WRITE_BIT);
+    glNamedBufferStorage(obj.buffers[1], 2048 * sizeof(uint32_t), nullptr, GL_MAP_WRITE_BIT);
+    glNamedBufferStorage(obj.buffers[2], 4096, nullptr, GL_MAP_WRITE_BIT);
+
+    BufferMapping::create(obj.buffers[0], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT)
+        .map([](BufferMapping mapping) {
+            const VertexPCT tri_verts[] = {
+                { .pos = { -1.0f, -1.0f, 0.0f }, .color = { 1.0f, 0.0f, 0.0f, 1.0f }, .uv = { 0.0f, 0.0f } },
+                { .pos = { 0.0f, 1.0f, 0.0f }, .color = { 0.0f, 1.0f, 0.0f, 1.0f }, .uv = { 0.5f, 0.5f } },
+                { .pos = { 1.0f, -1.0f, 0.0f }, .color = { 0.0f, 0.0f, 1.0f, 1.0f }, .uv = { 1.0f, 0.0f } }
+            };
+
+            memcpy(mapping.mapped_addr, tri_verts, sizeof(tri_verts));
+        });
+
+    BufferMapping::create(obj.buffers[1], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)
+        .map([](BufferMapping ibmap) {
+            const uint32_t indices[] = { 2, 1, 0 }; // CCW
+            memcpy(ibmap.mapped_addr, indices, sizeof(indices));
+        });
+
+    glCreateVertexArrays(1, &obj.vertex_array);
+    glVertexArrayAttribFormat(obj.vertex_array, 0, 3, GL_FLOAT, GL_FALSE, offsetof(VertexPCT, pos));
+    glEnableVertexArrayAttrib(obj.vertex_array, 0);
+    glVertexArrayAttribBinding(obj.vertex_array, 0, 0);
+
+    glVertexArrayAttribFormat(obj.vertex_array, 1, 4, GL_FLOAT, GL_FALSE, offsetof(VertexPCT, color));
+    glVertexArrayAttribBinding(obj.vertex_array, 1, 0);
+    glEnableVertexArrayAttrib(obj.vertex_array, 1);
+
+    glVertexArrayAttribFormat(obj.vertex_array, 2, 2, GL_FLOAT, GL_FALSE, offsetof(VertexPCT, uv));
+    glVertexArrayAttribBinding(obj.vertex_array, 2, 0);
+    glEnableVertexArrayAttrib(obj.vertex_array, 2);
+
+    glVertexArrayVertexBuffer(obj.vertex_array, 0, obj.buffers[0], 0, sizeof(VertexPCT));
+    glVertexArrayElementBuffer(obj.vertex_array, obj.buffers[1]);
+
+    glCreateProgramPipelines(size(obj.program_pipeline), obj.program_pipeline);
+    constexpr const tuple<const char*, const char*, GLbitfield> shader_create_data[] = {
+        { "data/shaders/triangle/tri.vert", "main", GL_VERTEX_SHADER_BIT },
+        { "data/shaders/triangle/tri.frag", "main", GL_FRAGMENT_SHADER_BIT }
+    };
+
+    size_t idx{};
+    for (auto [shader_path, entry_point, shader_stage] : shader_create_data) {
+        auto shader_prog = create_gpu_program_from_file(shader_path, entry_point, {});
+        if (!shader_prog)
+            return tl::make_unexpected(shader_prog.error());
+
+        obj.gpu_programs[idx++] = *shader_prog;
+        glUseProgramStages(obj.program_pipeline[0], shader_stage, *shader_prog);
+    }
+
+    auto maybe_texture = Texture::from_file("data/textures/ash_uvgrid02.jpg");
+    if (!maybe_texture) {
+        return tl::make_unexpected(maybe_texture.error());
+    }
+
+    obj.texture = *maybe_texture;
+
+    glCreateSamplers(1, &obj.sampler);
+    glSamplerParameteri(obj.sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glSamplerParameteri(obj.sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    return tl::expected<TriangleDemo, GenericProgramError>{ std::move(obj) };
+}
+
+struct GeometryNode
+{
+    tl::optional<uint32_t> parent{};
+    string name{};
+    glm::mat4 transform{ glm::identity<glm::mat4>() };
+    // bbox
+    uint32_t vertex_offset{};
+    uint32_t index_offset{};
+    uint32_t index_count{};
+};
+
+struct GeometryVertex
+{
+    glm::vec3 pos;
+    glm::vec3 normal;
+    glm::vec4 color;
+    glm::vec4 tangent;
+    glm::vec2 uv;
+    uint32_t pbr_buf_id;
+};
+
+struct MaterialDefinition
+{
+    string name;
+    uint32_t base_color_src;
+    uint32_t metallic_src;
+    uint32_t normal_src;
+    float metallic_factor;
+    float roughness_factor;
+    glm::vec4 base_color_factor;
+};
+
+struct LoadedGeometry
+{
+    std::vector<GeometryNode> nodes;
+    std::unique_ptr<tinygltf::Model> gltf;
+    uint32_t vertex_count{};
+    uint32_t index_count{};
+
+    void process_nodes();
+    void process_one_node(const tinygltf::Node& node, const tl::optional<uint32_t> parent);
+};
+
+void
+LoadedGeometry::process_nodes()
+{
+    for (const tinygltf::Scene& s : gltf->scenes) {
+        for (const int node_idx : s.nodes) {
+            process_one_node(gltf->nodes[node_idx], tl::nullopt);
+        }
+    }
+}
+
+void
+LoadedGeometry::process_one_node(const tinygltf::Node& node, const tl::optional<uint32_t> parent)
+{
+    const glm::dmat4 node_transform = [n = &node]() {
+        if (!n->matrix.empty()) {
+            return glm::make_mat4(n->matrix.data());
+        }
+
+        glm::dmat4 node_transform{ glm::identity<glm::mat4>() };
+        if (!n->scale.empty()) {
+            node_transform = glm::scale(node_transform, glm::make_vec3(n->scale.data()));
+        }
+
+        if (!n->rotation.empty()) {
+            node_transform = glm::toMat4(glm::make_quat(n->rotation.data())) * node_transform;
+        }
+
+        if (!n->translation.empty()) {
+            node_transform = glm::translate(node_transform, glm::make_vec3(n->translation.data()));
+        }
+
+        return node_transform;
+    }();
+
+    const uint32_t node_id = static_cast<uint32_t>(nodes.size());
+    this->nodes.emplace_back(parent, node.name, glm::mat4{ node_transform }, vertex_count, index_count, 0);
+
+    for (const int child_idx : node.children) {
+        process_one_node(gltf->nodes[child_idx], tl::optional<uint32_t>{ node_id });
+    }
+
+    if (node.mesh != -1) {
+        tl::optional<uint32_t> ancestor{ parent };
+        glm::mat4 transform{ node_transform };
+
+        while (ancestor) {
+            const GeometryNode* a = &nodes[*ancestor];
+            transform = a->transform * transform;
+            ancestor = a->parent;
+        }
+
+        nodes[node_id].transform = transform;
+        const glm::mat4 normals_matrix = glm::transpose(glm::inverse(transform));
+
+        const tinygltf::Mesh* mesh = &gltf->meshes[node.mesh];
+        for (const tinygltf::Primitive& prim : mesh->primitives) {
+        }
+    }
+}
+
+void
+load_model()
+{
+    tinygltf::Model model;
+    tinygltf::TinyGLTF loader;
+
+    string error;
+    string warning;
+    if (!loader.LoadBinaryFromFile(&model, &error, &warning, "data/models/ivanova_fury.glb")) {
+        LOG_ERROR(g_logger, "Failed to load model: {} {}", error, warning);
+        return;
+    }
+
+    for (const tinygltf::Node& n : model.nodes) {
+        LOG_INFO(g_logger,
+                 "Node {}\nchildren {}\nrotation {}\nscale {}\ntranslation {}\nmatrix {}",
+                 n.name,
+                 n.children,
+                 n.rotation,
+                 n.scale,
+                 n.translation,
+                 n.matrix);
+    }
+}
 
 int
 main(int, char**)
 {
-    // vector<int32_t> intvec{};
-    // apply_to_cont(intvec, 1024);
-    // assert(intvec.capacity() == 1024);
-    //
-    // unordered_map<int32_t, int32_t> intmap{};
-    // apply_to_cont(intmap, 1024);
-
-    // vector<int32_t> iv0{};
-    // vector<int32_t> iv1{};
-    //
-    // resize_and_clear(1024, iv0, iv1);
-    //
-
     quill::Backend::start();
     auto console_sink = quill::Frontend::create_or_get_sink<quill::ConsoleSink>("console_color_sink");
     g_logger = quill::Frontend::create_or_get_logger("global_logger", std::move(console_sink));
@@ -346,11 +1305,13 @@ main(int, char**)
 
     LOG_INFO(g_logger, "Starting up ...");
 
-    if (!SDL_FUNC_CALL(SDL_InitSubSystem, SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+    load_model();
+
+    if (!CHECKED_SDL(SDL_InitSubSystem, SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         return EXIT_FAILURE;
     }
 
-    SDL_Window* window{ SDL_FUNC_CALL(
+    SDL_Window* window{ CHECKED_SDL(
         SDL_CreateWindow, "SDL Window", 1600, 1200, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE) };
 
     if (!window) {
@@ -371,7 +1332,7 @@ main(int, char**)
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG | SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
 
-    SDL_GLContext gl_context = SDL_FUNC_CALL(SDL_GL_CreateContext, window);
+    SDL_GLContext gl_context = CHECKED_SDL(SDL_GL_CreateContext, window);
     if (!gl_context) {
         return EXIT_FAILURE;
     }
@@ -415,13 +1376,20 @@ main(int, char**)
         }
     }
 
-    const glsl_preprocessor_define shader_macros[] = { { "OUTPUT_COORDS", "vec4(1.0, 0.0, 1.0, 1.0)" } };
-    compile_shader_from_file("shader.vert", "main", span{ shader_macros });
+    auto tri_demo = TriangleDemo::create();
+    if (!tri_demo)
+        return EXIT_FAILURE;
 
-    array<char, 2048> temp_buffer{};
+    auto ui_backend = BackendUI::create(window);
+    if (!ui_backend)
+        return EXIT_FAILURE;
 
     for (bool quit = false; !quit;) {
         SDL_Event e;
+
+        UIContext ui_ctx = ui_backend->new_frame();
+        ui_backend->input_begin();
+
         while (SDL_PollEvent(&e)) {
             switch (e.type) {
                 case SDL_EVENT_QUIT: {
@@ -437,7 +1405,11 @@ main(int, char**)
                 default:
                     break;
             }
+
+            ui_backend->handle_event(&e);
         }
+
+        ui_backend->input_end();
 
         int32_t width{};
         int32_t height{};
@@ -445,9 +1417,15 @@ main(int, char**)
 
         glViewportIndexedf(0, 0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height));
 
-        const float clear_color[] = { 0.0f, 1.0f, 0.0f, 1.0f };
+        const float clear_color[] = { 0.0f, 0.0f, 0.0f, 1.0f };
         glClearNamedFramebufferfv(0, GL_COLOR, 0, clear_color);
         glClearNamedFramebufferfi(0, GL_DEPTH_STENCIL, 0, 1.0f, 0xff);
+
+        const DrawParams draw_params{ width, height };
+
+        tri_demo->ui(&ui_ctx);
+        tri_demo->render(draw_params);
+        ui_backend->render(draw_params);
 
         SDL_GL_SwapWindow(window);
 

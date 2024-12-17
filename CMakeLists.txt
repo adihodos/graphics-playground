@@ -4,6 +4,7 @@ project(playground LANGUAGES C CXX)
 include(cmake/CPM.cmake)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS "ON")
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 # FetchContent_Declare(libconfig GIT_REPOSITORY
 # https://github.com/hyperrealm/libconfig)
@@ -15,7 +16,17 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS "ON")
 
 find_package(Vulkan REQUIRED COMPONENTS glslang shaderc_combined)
 
-cpmaddpackage("gh:libsdl-org/SDL#main")
+cpmaddpackage(
+  NAME
+  SDL3
+  GITHUB_REPOSITORY
+  libsdl-org/SDL
+  GIT_TAG
+  main
+  OPTIONS
+  "SDL_STATIC ON")
+
+cpmaddpackage("gh:vimpunk/mio#master")
 cpmaddpackage("gh:fmtlib/fmt#11.0.2")
 cpmaddpackage("gh:odygrd/quill@7.5.0")
 cpmaddpackage("gh:g-truc/glm#bf71a834948186f4097caa076cd2663c69a10e1e")
@@ -54,7 +65,13 @@ set(SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/small_vector.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/small_vector.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/glad.cc)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/glad.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arcball.camera.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arcball.camera.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/renderer.common.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/geometry.loader.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/geometry.loader.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/error.hpp)
 
 add_executable(${CMAKE_PROJECT_NAME} ${SOURCE_FILES})
 add_dependencies(${CMAKE_PROJECT_NAME} copy_data)
@@ -73,4 +90,5 @@ target_link_libraries(
           tl::optional
           stb
           nuklear
-          tinygltf)
+          tinygltf
+          mio::mio)

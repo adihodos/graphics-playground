@@ -16,10 +16,10 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include <ranges>
 
 #include <fmt/core.h>
-
-#include <ranges>
+#include <mio/mmap.hpp>
 
 #include "fn.hpp"
 #include "small_vector.hpp"
@@ -52,6 +52,11 @@
 #include <nuklear.h>
 #include <tiny_gltf.h>
 
+#include "arcball.camera.hpp"
+#include "renderer.common.hpp"
+#include "geometry.loader.hpp"
+#include "error.hpp"
+
 #define PL_STRINGIZE(x) #x
 
 namespace fn = rangeless::fn;
@@ -62,35 +67,10 @@ using namespace std;
 
 quill::Logger* g_logger{};
 
-struct DrawParams
-{
-    int32_t surface_width;
-    int32_t surface_height;
-    int32_t display_width;
-    int32_t display_height;
-};
-
 struct UIContext
 {
     struct nk_context* ctx;
 };
-
-struct OpenGLError
-{
-    GLenum error_code;
-};
-
-struct ShadercError
-{
-    std::string message;
-};
-
-struct SystemError
-{
-    std::error_code e;
-};
-
-using GenericProgramError = std::variant<std::monostate, OpenGLError, ShadercError, SystemError>;
 
 template<typename error_func, typename called_function, typename... called_func_args>
 auto
@@ -396,7 +376,7 @@ gl_debug_callback(GLenum source,
     if (severity == GL_DEBUG_SEVERITY_HIGH || severity == GL_DEBUG_SEVERITY_MEDIUM) {
         LOG_ERROR(g_logger, "{}", monka_mega_scratch_msg_buffer);
     } else {
-        LOG_DEBUG(g_logger, "{}", monka_mega_scratch_msg_buffer);
+        // LOG_DEBUG(g_logger, "{}", monka_mega_scratch_msg_buffer);
     }
 }
 
@@ -546,7 +526,7 @@ struct BackendUI
     nk_context ctx;
     nk_font_atlas atlas;
     nk_font* default_font{};
-    uint64_t time_of_last_frame;
+    uint64_t time_of_last_frame{};
 
     static constexpr const uint32_t MAX_VERTICES = 8192;
     static constexpr const uint32_t MAX_INDICES = 65535;
@@ -941,7 +921,6 @@ BackendUI::render(const DrawParams& dp)
                 continue;
 
             glBindTextureUnit(0, static_cast<GLuint>(cmd->texture.id));
-            LOG_INFO(g_logger, "texture id {}", cmd->texture.id);
             glScissor((GLint)(cmd->clip_rect.x * scale.x),
                       (GLint)((dp.surface_height - (GLint)(cmd->clip_rect.y + cmd->clip_rect.h)) * scale.y),
                       (GLint)(cmd->clip_rect.w * scale.x),
@@ -957,6 +936,7 @@ BackendUI::render(const DrawParams& dp)
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
 }
 
 void
@@ -982,7 +962,7 @@ struct UniformBuffer
     glm::mat4 wvp;
 };
 
-struct TriangleDemo
+struct SimpleDemo
 {
     GLuint buffers[3];
     GLuint vertex_array;
@@ -990,27 +970,28 @@ struct TriangleDemo
     GLuint program_pipeline[1];
     GLuint sampler;
     Texture texture;
+    uint32_t indexcount{};
 
-    static tl::expected<TriangleDemo, GenericProgramError> create();
+    static tl::expected<SimpleDemo, GenericProgramError> create();
 
-    TriangleDemo(const TriangleDemo&) = delete;
-    TriangleDemo& operator=(const TriangleDemo&) = delete;
+    SimpleDemo(const SimpleDemo&) = delete;
+    SimpleDemo& operator=(const SimpleDemo&) = delete;
 
-    TriangleDemo() = default;
-    TriangleDemo(TriangleDemo&& rhs) noexcept
+    SimpleDemo() = default;
+    SimpleDemo(SimpleDemo&& rhs) noexcept
     {
         memcpy(this, &rhs, sizeof(*this));
         memset(&rhs, 0, sizeof(*this));
     }
 
-    ~TriangleDemo();
+    ~SimpleDemo();
 
     void ui(UIContext* ui);
     void render(const DrawParams& dp);
 };
 
 void
-TriangleDemo::ui(UIContext* ui)
+SimpleDemo::ui(UIContext* ui)
 {
     struct nk_context* ctx = ui->ctx;
     static nk_colorf bg{ .r = 0.10f, .g = 0.18f, .b = 0.24f, .a = 1.0f };
@@ -1051,29 +1032,43 @@ TriangleDemo::ui(UIContext* ui)
             bg.a = nk_propertyf(ctx, "#A:", 0, bg.a, 1.0f, 0.01f, 0.005f);
             nk_combo_end(ctx);
         }
+
+        // char temp_buffer[1024];
+        // auto out = fmt::format_to_n(temp_buffer, size(temp_buffer), "Vertices {}, indices {}", vtx_idx.x, vtx_idx.y);
+        //*out.out = 0;
+        // nk_label_colored(ctx, temp_buffer, NK_TEXT_CENTERED, nk_color{ 255, 0, 0, 255 });
     }
     nk_end(ctx);
 }
 
 void
-TriangleDemo::render(const DrawParams& dp)
+SimpleDemo::render(const DrawParams& dp)
 {
     const GLuint uniform_buffer = buffers[2];
+
     BufferMapping::create(uniform_buffer, 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT).map([&](BufferMapping m) {
         const glm::mat4 mtx = glm::identity<glm::mat4>();
-
-        memcpy(m.mapped_addr, &mtx, sizeof(mtx));
+        const glm::mat4 final = glm::perspectiveFov(glm::radians(65.0f),
+                                                    static_cast<float>(dp.surface_width),
+                                                    static_cast<float>(dp.surface_height),
+                                                    -1.0f,
+                                                    +1.0f) *
+                                dp.cam->view_transform * mtx;
+        memcpy(m.mapped_addr, &final, sizeof(final));
     });
 
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CCW);
     glBindVertexArray(vertex_array);
     glBindProgramPipeline(this->program_pipeline[0]);
     glBindBufferRange(GL_UNIFORM_BUFFER, 0, uniform_buffer, 0, 4096);
     glBindTextureUnit(0, texture.handle);
     glBindSampler(0, sampler);
-    glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_INT, nullptr);
+    glDrawElements(GL_TRIANGLES, indexcount, GL_UNSIGNED_INT, nullptr);
 }
 
-TriangleDemo::~TriangleDemo()
+SimpleDemo::~SimpleDemo()
 {
     glDeleteBuffers(size(buffers), buffers);
     glDeleteVertexArrays(1, &vertex_array);
@@ -1086,55 +1081,49 @@ TriangleDemo::~TriangleDemo()
     glDeleteTextures(1, &texture.handle);
 }
 
-struct VertexPCT
+tl::expected<SimpleDemo, GenericProgramError>
+SimpleDemo::create()
 {
-    glm::vec3 pos;
-    glm::vec4 color;
-    glm::vec2 uv;
-};
-
-tl::expected<TriangleDemo, GenericProgramError>
-TriangleDemo::create()
-{
-    TriangleDemo obj{};
+    SimpleDemo obj{};
 
     glCreateBuffers(size(obj.buffers), obj.buffers);
 
-    glNamedBufferStorage(obj.buffers[0], 256 * sizeof(VertexPCT), nullptr, GL_MAP_WRITE_BIT);
-    glNamedBufferStorage(obj.buffers[1], 2048 * sizeof(uint32_t), nullptr, GL_MAP_WRITE_BIT);
-    glNamedBufferStorage(obj.buffers[2], 4096, nullptr, GL_MAP_WRITE_BIT);
+    auto geometry = LoadedGeometry::from_file("data/models/ivanova_fury.glb");
+    if (!geometry)
+        return tl::make_unexpected(geometry.error());
 
-    BufferMapping::create(obj.buffers[0], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT)
-        .map([](BufferMapping mapping) {
-            const VertexPCT tri_verts[] = {
-                { .pos = { -1.0f, -1.0f, 0.0f }, .color = { 1.0f, 0.0f, 0.0f, 1.0f }, .uv = { 0.0f, 0.0f } },
-                { .pos = { 0.0f, 1.0f, 0.0f }, .color = { 0.0f, 1.0f, 0.0f, 1.0f }, .uv = { 0.5f, 0.5f } },
-                { .pos = { 1.0f, -1.0f, 0.0f }, .color = { 0.0f, 0.0f, 1.0f, 1.0f }, .uv = { 1.0f, 0.0f } }
-            };
+    const glm::uvec2 counts = geometry->compute_vertex_index_count();
+    const GLsizei buffer_sizes[] = { static_cast<GLsizei>(counts.x * sizeof(GeometryVertex)),
+                                     static_cast<GLsizei>(counts.y * sizeof(uint32_t)),
+                                     4096 };
 
-            memcpy(mapping.mapped_addr, tri_verts, sizeof(tri_verts));
-        });
+    for (size_t i = 0; i < size(obj.buffers); ++i) {
+        glNamedBufferStorage(obj.buffers[i], buffer_sizes[i], nullptr, GL_MAP_WRITE_BIT);
+    }
 
-    BufferMapping::create(obj.buffers[1], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)
-        .map([](BufferMapping ibmap) {
-            const uint32_t indices[] = { 2, 1, 0 }; // CCW
-            memcpy(ibmap.mapped_addr, indices, sizeof(indices));
-        });
+    llvm::SmallVector<BufferMapping, 4> mapped_buffers;
+    for (size_t i = 0; i < 2; ++i) {
+        auto mapping = BufferMapping::create(obj.buffers[i], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+        if (!mapping)
+            return tl::make_unexpected(mapping.error());
+
+        mapped_buffers.push_back(std::move(*mapping));
+    }
+
+    const glm::vec2 extracted_count =
+        geometry->extract_data(mapped_buffers[0].mapped_addr, mapped_buffers[1].mapped_addr, glm::vec2{});
+    LOG_INFO(g_logger, "Extracted {} vertices, {} indices", extracted_count.x, extracted_count.y);
 
     glCreateVertexArrays(1, &obj.vertex_array);
-    glVertexArrayAttribFormat(obj.vertex_array, 0, 3, GL_FLOAT, GL_FALSE, offsetof(VertexPCT, pos));
-    glEnableVertexArrayAttrib(obj.vertex_array, 0);
-    glVertexArrayAttribBinding(obj.vertex_array, 0, 0);
 
-    glVertexArrayAttribFormat(obj.vertex_array, 1, 4, GL_FLOAT, GL_FALSE, offsetof(VertexPCT, color));
-    glVertexArrayAttribBinding(obj.vertex_array, 1, 0);
-    glEnableVertexArrayAttrib(obj.vertex_array, 1);
+    for (size_t i = 0; i < size(FormatDescriptors<GeometryVertex>::descriptors); ++i) {
+        const VertexFormatDescriptor& fd = FormatDescriptors<GeometryVertex>::descriptors[i];
+        glVertexArrayAttribFormat(obj.vertex_array, i, fd.size, fd.type, fd.normalized, fd.offset);
+        glEnableVertexArrayAttrib(obj.vertex_array, i);
+        glVertexArrayAttribBinding(obj.vertex_array, i, 0);
+    }
 
-    glVertexArrayAttribFormat(obj.vertex_array, 2, 2, GL_FLOAT, GL_FALSE, offsetof(VertexPCT, uv));
-    glVertexArrayAttribBinding(obj.vertex_array, 2, 0);
-    glEnableVertexArrayAttrib(obj.vertex_array, 2);
-
-    glVertexArrayVertexBuffer(obj.vertex_array, 0, obj.buffers[0], 0, sizeof(VertexPCT));
+    glVertexArrayVertexBuffer(obj.vertex_array, 0, obj.buffers[0], 0, sizeof(GeometryVertex));
     glVertexArrayElementBuffer(obj.vertex_array, obj.buffers[1]);
 
     glCreateProgramPipelines(size(obj.program_pipeline), obj.program_pipeline);
@@ -1159,140 +1148,13 @@ TriangleDemo::create()
     }
 
     obj.texture = *maybe_texture;
+    obj.indexcount = counts.y;
 
     glCreateSamplers(1, &obj.sampler);
     glSamplerParameteri(obj.sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glSamplerParameteri(obj.sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    return tl::expected<TriangleDemo, GenericProgramError>{ std::move(obj) };
-}
-
-struct GeometryNode
-{
-    tl::optional<uint32_t> parent{};
-    string name{};
-    glm::mat4 transform{ glm::identity<glm::mat4>() };
-    // bbox
-    uint32_t vertex_offset{};
-    uint32_t index_offset{};
-    uint32_t index_count{};
-};
-
-struct GeometryVertex
-{
-    glm::vec3 pos;
-    glm::vec3 normal;
-    glm::vec4 color;
-    glm::vec4 tangent;
-    glm::vec2 uv;
-    uint32_t pbr_buf_id;
-};
-
-struct MaterialDefinition
-{
-    string name;
-    uint32_t base_color_src;
-    uint32_t metallic_src;
-    uint32_t normal_src;
-    float metallic_factor;
-    float roughness_factor;
-    glm::vec4 base_color_factor;
-};
-
-struct LoadedGeometry
-{
-    std::vector<GeometryNode> nodes;
-    std::unique_ptr<tinygltf::Model> gltf;
-    uint32_t vertex_count{};
-    uint32_t index_count{};
-
-    void process_nodes();
-    void process_one_node(const tinygltf::Node& node, const tl::optional<uint32_t> parent);
-};
-
-void
-LoadedGeometry::process_nodes()
-{
-    for (const tinygltf::Scene& s : gltf->scenes) {
-        for (const int node_idx : s.nodes) {
-            process_one_node(gltf->nodes[node_idx], tl::nullopt);
-        }
-    }
-}
-
-void
-LoadedGeometry::process_one_node(const tinygltf::Node& node, const tl::optional<uint32_t> parent)
-{
-    const glm::dmat4 node_transform = [n = &node]() {
-        if (!n->matrix.empty()) {
-            return glm::make_mat4(n->matrix.data());
-        }
-
-        glm::dmat4 node_transform{ glm::identity<glm::mat4>() };
-        if (!n->scale.empty()) {
-            node_transform = glm::scale(node_transform, glm::make_vec3(n->scale.data()));
-        }
-
-        if (!n->rotation.empty()) {
-            node_transform = glm::toMat4(glm::make_quat(n->rotation.data())) * node_transform;
-        }
-
-        if (!n->translation.empty()) {
-            node_transform = glm::translate(node_transform, glm::make_vec3(n->translation.data()));
-        }
-
-        return node_transform;
-    }();
-
-    const uint32_t node_id = static_cast<uint32_t>(nodes.size());
-    this->nodes.emplace_back(parent, node.name, glm::mat4{ node_transform }, vertex_count, index_count, 0);
-
-    for (const int child_idx : node.children) {
-        process_one_node(gltf->nodes[child_idx], tl::optional<uint32_t>{ node_id });
-    }
-
-    if (node.mesh != -1) {
-        tl::optional<uint32_t> ancestor{ parent };
-        glm::mat4 transform{ node_transform };
-
-        while (ancestor) {
-            const GeometryNode* a = &nodes[*ancestor];
-            transform = a->transform * transform;
-            ancestor = a->parent;
-        }
-
-        nodes[node_id].transform = transform;
-        const glm::mat4 normals_matrix = glm::transpose(glm::inverse(transform));
-
-        const tinygltf::Mesh* mesh = &gltf->meshes[node.mesh];
-        for (const tinygltf::Primitive& prim : mesh->primitives) {
-        }
-    }
-}
-
-void
-load_model()
-{
-    tinygltf::Model model;
-    tinygltf::TinyGLTF loader;
-
-    string error;
-    string warning;
-    if (!loader.LoadBinaryFromFile(&model, &error, &warning, "data/models/ivanova_fury.glb")) {
-        LOG_ERROR(g_logger, "Failed to load model: {} {}", error, warning);
-        return;
-    }
-
-    for (const tinygltf::Node& n : model.nodes) {
-        LOG_INFO(g_logger,
-                 "Node {}\nchildren {}\nrotation {}\nscale {}\ntranslation {}\nmatrix {}",
-                 n.name,
-                 n.children,
-                 n.rotation,
-                 n.scale,
-                 n.translation,
-                 n.matrix);
-    }
+    return tl::expected<SimpleDemo, GenericProgramError>{ std::move(obj) };
 }
 
 int
@@ -1304,8 +1166,6 @@ main(int, char**)
     g_logger->set_log_level(quill::LogLevel::Debug);
 
     LOG_INFO(g_logger, "Starting up ...");
-
-    load_model();
 
     if (!CHECKED_SDL(SDL_InitSubSystem, SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         return EXIT_FAILURE;
@@ -1376,13 +1236,17 @@ main(int, char**)
         }
     }
 
-    auto tri_demo = TriangleDemo::create();
+    auto tri_demo = SimpleDemo::create();
     if (!tri_demo)
         return EXIT_FAILURE;
 
     auto ui_backend = BackendUI::create(window);
     if (!ui_backend)
         return EXIT_FAILURE;
+
+    glm::ivec2 screen_size{};
+    SDL_GetWindowSizeInPixels(window, &screen_size.x, &screen_size.y);
+    ArcballCamera cam{ glm::vec3{ 0.0f, 0.0f, 0.0f }, 1.0f, screen_size };
 
     for (bool quit = false; !quit;) {
         SDL_Event e;
@@ -1407,21 +1271,20 @@ main(int, char**)
             }
 
             ui_backend->handle_event(&e);
+            cam.input_event(&e);
         }
 
         ui_backend->input_end();
+        cam.update();
 
-        int32_t width{};
-        int32_t height{};
-        SDL_GetWindowSizeInPixels(window, &width, &height);
-
-        glViewportIndexedf(0, 0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height));
+        SDL_GetWindowSizeInPixels(window, &screen_size.x, &screen_size.y);
+        glViewportIndexedf(0, 0.0f, 0.0f, static_cast<float>(screen_size.x), static_cast<float>(screen_size.y));
 
         const float clear_color[] = { 0.0f, 0.0f, 0.0f, 1.0f };
         glClearNamedFramebufferfv(0, GL_COLOR, 0, clear_color);
         glClearNamedFramebufferfi(0, GL_DEPTH_STENCIL, 0, 1.0f, 0xff);
 
-        const DrawParams draw_params{ width, height };
+        const DrawParams draw_params{ screen_size.x, screen_size.y, screen_size.x, screen_size.y, &cam };
 
         tri_demo->ui(&ui_ctx);
         tri_demo->render(draw_params);
@@ -1429,7 +1292,7 @@ main(int, char**)
 
         SDL_GL_SwapWindow(window);
 
-        this_thread::sleep_for(chrono::milliseconds(50));
+        this_thread::sleep_for(chrono::milliseconds(25));
     }
 
     SDL_Quit();

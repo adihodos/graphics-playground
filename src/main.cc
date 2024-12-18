@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include <algorithm>
+#include <bitset>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -962,15 +963,37 @@ struct UniformBuffer
     glm::mat4 wvp;
 };
 
+struct DemoOptions
+{
+    uint32_t fill_mode{ GL_FILL };
+};
+
 struct SimpleDemo
 {
-    GLuint buffers[3];
-    GLuint vertex_array;
-    GLuint gpu_programs[2];
-    GLuint program_pipeline[1];
-    GLuint sampler;
-    Texture texture;
-    uint32_t indexcount{};
+    DemoOptions opts{};
+
+    struct RenderState
+    {
+        // 0 vertex, 1 index, 2 ubo, 3 indirect draw commands
+        GLuint buffers[4]{};
+        GLuint vertex_array{};
+        GLuint gpu_programs[2]{};
+        GLuint program_pipeline[1]{};
+        GLuint sampler{};
+        Texture texture{};
+
+        RenderState() = default;
+        RenderState(RenderState&& rhs) noexcept
+        {
+            memcpy(this, &rhs, sizeof(*this));
+            memset(&rhs, 0, sizeof(*this));
+        }
+    } render_state;
+
+    vector<GeometryNode> geometry_nodes{};
+    vector<DrawElementsIndirectCommand> draws_data{};
+    bitset<128> nodes_visibility{};
+    bool flush_draw_cmds{ false };
 
     static tl::expected<SimpleDemo, GenericProgramError> create();
 
@@ -978,12 +1001,7 @@ struct SimpleDemo
     SimpleDemo& operator=(const SimpleDemo&) = delete;
 
     SimpleDemo() = default;
-    SimpleDemo(SimpleDemo&& rhs) noexcept
-    {
-        memcpy(this, &rhs, sizeof(*this));
-        memset(&rhs, 0, sizeof(*this));
-    }
-
+    SimpleDemo(SimpleDemo&&) = default;
     ~SimpleDemo();
 
     void ui(UIContext* ui);
@@ -996,47 +1014,33 @@ SimpleDemo::ui(UIContext* ui)
     struct nk_context* ctx = ui->ctx;
     static nk_colorf bg{ .r = 0.10f, .g = 0.18f, .b = 0.24f, .a = 1.0f };
 
+    char scratch_buffer[1024];
+
     if (nk_begin(ctx,
-                 "Demo",
-                 nk_rect(50, 50, 230, 250),
+                 "OpenGL Demo",
+                 nk_rect(50, 50, 320, 480),
                  NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE | NK_WINDOW_MINIMIZABLE | NK_WINDOW_TITLE)) {
-        enum
-        {
-            EASY,
-            HARD
-        };
-        static int op = EASY;
-        static int property = 20;
 
-        nk_layout_row_static(ctx, 30, 80, 1);
-        if (nk_button_label(ctx, "button"))
-            printf("button pressed!\n");
-        nk_layout_row_dynamic(ctx, 30, 2);
-        if (nk_option_label(ctx, "easy", op == EASY))
-            op = EASY;
-        if (nk_option_label(ctx, "hard", op == HARD))
-            op = HARD;
-        nk_layout_row_dynamic(ctx, 22, 1);
-        nk_property_int(ctx, "Compression:", 0, &property, 100, 10, 1);
-
-        nk_layout_row_dynamic(ctx, 20, 1);
-        nk_label(ctx, "background:", NK_TEXT_LEFT);
-        nk_layout_row_dynamic(ctx, 25, 1);
-        if (nk_combo_begin_color(ctx, nk_rgb_cf(bg), nk_vec2(nk_widget_width(ctx), 400))) {
-            nk_layout_row_dynamic(ctx, 120, 1);
-            bg = nk_color_picker(ctx, bg, NK_RGBA);
-            nk_layout_row_dynamic(ctx, 25, 1);
-            bg.r = nk_propertyf(ctx, "#R:", 0, bg.r, 1.0f, 0.01f, 0.005f);
-            bg.g = nk_propertyf(ctx, "#G:", 0, bg.g, 1.0f, 0.01f, 0.005f);
-            bg.b = nk_propertyf(ctx, "#B:", 0, bg.b, 1.0f, 0.01f, 0.005f);
-            bg.a = nk_propertyf(ctx, "#A:", 0, bg.a, 1.0f, 0.01f, 0.005f);
-            nk_combo_end(ctx);
+        nk_layout_row_dynamic(ctx, 32, 2);
+        if (nk_option_label(ctx, "Fill solid", opts.fill_mode == GL_FILL)) {
+            opts.fill_mode = GL_FILL;
+        }
+        if (nk_option_label(ctx, "Fill wireframe", opts.fill_mode == GL_LINE)) {
+            opts.fill_mode = GL_LINE;
         }
 
-        // char temp_buffer[1024];
-        // auto out = fmt::format_to_n(temp_buffer, size(temp_buffer), "Vertices {}, indices {}", vtx_idx.x, vtx_idx.y);
-        //*out.out = 0;
-        // nk_label_colored(ctx, temp_buffer, NK_TEXT_CENTERED, nk_color{ 255, 0, 0, 255 });
+        nk_layout_row_static(ctx, 32, 256, 1);
+
+        for (size_t i = 0, count = draws_data.size(); i < count; ++i) {
+            auto itr = fmt::format_to_n(scratch_buffer, size(scratch_buffer), "{}", geometry_nodes[i].name);
+            *itr.out = 0;
+
+            if (const auto value = nk_check_label(ctx, scratch_buffer, nodes_visibility[i]);
+                value != nodes_visibility[i]) {
+                flush_draw_cmds = true;
+                nodes_visibility[i] = value != nk_false;
+            }
+        }
     }
     nk_end(ctx);
 }
@@ -1044,41 +1048,63 @@ SimpleDemo::ui(UIContext* ui)
 void
 SimpleDemo::render(const DrawParams& dp)
 {
-    const GLuint uniform_buffer = buffers[2];
+    const size_t visible_nodes = nodes_visibility.count();
+    if (!visible_nodes)
+        return;
+
+    if (flush_draw_cmds) {
+        BufferMapping::create(render_state.buffers[3], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)
+            .map([&, this](BufferMapping m) {
+                DrawElementsIndirectCommand* cmd = static_cast<DrawElementsIndirectCommand*>(m.mapped_addr);
+                for (size_t i = 0, draw_cmds = draws_data.size(); i < draw_cmds; ++i) {
+                    if (!nodes_visibility[i])
+                        continue;
+
+                    *cmd++ = draws_data[i];
+                }
+            });
+        flush_draw_cmds = false;
+    }
+
+    const GLuint uniform_buffer = render_state.buffers[2];
 
     BufferMapping::create(uniform_buffer, 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT).map([&](BufferMapping m) {
         const glm::mat4 mtx = glm::identity<glm::mat4>();
         const glm::mat4 final = glm::perspectiveFov(glm::radians(65.0f),
                                                     static_cast<float>(dp.surface_width),
                                                     static_cast<float>(dp.surface_height),
-                                                    -1.0f,
-                                                    +1.0f) *
+                                                    0.1f,
+                                                    1000.0f) *
                                 dp.cam->view_transform * mtx;
         memcpy(m.mapped_addr, &final, sizeof(final));
     });
 
+    glPolygonMode(GL_FRONT_AND_BACK, opts.fill_mode);
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
     glFrontFace(GL_CCW);
-    glBindVertexArray(vertex_array);
-    glBindProgramPipeline(this->program_pipeline[0]);
+    glBindVertexArray(render_state.vertex_array);
+    glBindProgramPipeline(render_state.program_pipeline[0]);
     glBindBufferRange(GL_UNIFORM_BUFFER, 0, uniform_buffer, 0, 4096);
-    glBindTextureUnit(0, texture.handle);
-    glBindSampler(0, sampler);
-    glDrawElements(GL_TRIANGLES, indexcount, GL_UNSIGNED_INT, nullptr);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, render_state.buffers[3]);
+    glBindTextureUnit(0, render_state.texture.handle);
+    glBindSampler(0, render_state.sampler);
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, static_cast<GLsizei>(visible_nodes), 0);
+
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 }
 
 SimpleDemo::~SimpleDemo()
 {
-    glDeleteBuffers(size(buffers), buffers);
-    glDeleteVertexArrays(1, &vertex_array);
+    glDeleteBuffers(size(render_state.buffers), render_state.buffers);
+    glDeleteVertexArrays(1, &render_state.vertex_array);
 
-    for (const GLuint prog : gpu_programs)
+    for (const GLuint prog : render_state.gpu_programs)
         glDeleteProgram(prog);
 
-    glDeleteProgramPipelines(size(program_pipeline), program_pipeline);
-    glDeleteSamplers(1, &sampler);
-    glDeleteTextures(1, &texture.handle);
+    glDeleteProgramPipelines(size(render_state.program_pipeline), render_state.program_pipeline);
+    glDeleteSamplers(1, &render_state.sampler);
+    glDeleteTextures(1, &render_state.texture.handle);
 }
 
 tl::expected<SimpleDemo, GenericProgramError>
@@ -1086,7 +1112,7 @@ SimpleDemo::create()
 {
     SimpleDemo obj{};
 
-    glCreateBuffers(size(obj.buffers), obj.buffers);
+    glCreateBuffers(size(obj.render_state.buffers), obj.render_state.buffers);
 
     auto geometry = LoadedGeometry::from_file("data/models/ivanova_fury.glb");
     if (!geometry)
@@ -1095,15 +1121,17 @@ SimpleDemo::create()
     const glm::uvec2 counts = geometry->compute_vertex_index_count();
     const GLsizei buffer_sizes[] = { static_cast<GLsizei>(counts.x * sizeof(GeometryVertex)),
                                      static_cast<GLsizei>(counts.y * sizeof(uint32_t)),
-                                     4096 };
+                                     4096,
+                                     static_cast<GLsizei>(128 * sizeof(DrawElementsIndirectCommand)) };
 
-    for (size_t i = 0; i < size(obj.buffers); ++i) {
-        glNamedBufferStorage(obj.buffers[i], buffer_sizes[i], nullptr, GL_MAP_WRITE_BIT);
+    for (size_t i = 0; i < size(obj.render_state.buffers); ++i) {
+        glNamedBufferStorage(obj.render_state.buffers[i], buffer_sizes[i], nullptr, GL_MAP_WRITE_BIT);
     }
 
     llvm::SmallVector<BufferMapping, 4> mapped_buffers;
     for (size_t i = 0; i < 2; ++i) {
-        auto mapping = BufferMapping::create(obj.buffers[i], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+        auto mapping =
+            BufferMapping::create(obj.render_state.buffers[i], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
         if (!mapping)
             return tl::make_unexpected(mapping.error());
 
@@ -1114,19 +1142,37 @@ SimpleDemo::create()
         geometry->extract_data(mapped_buffers[0].mapped_addr, mapped_buffers[1].mapped_addr, glm::vec2{});
     LOG_INFO(g_logger, "Extracted {} vertices, {} indices", extracted_count.x, extracted_count.y);
 
-    glCreateVertexArrays(1, &obj.vertex_array);
+    for (const GeometryNode& n : geometry->nodes) {
+        const DrawElementsIndirectCommand cmd{
+            .count = n.index_count, .instanceCount = 1, .firstIndex = n.index_offset, .baseVertex = 0, .baseInstance = 0
+        };
+
+        obj.draws_data.push_back(cmd);
+    }
+
+    BufferMapping::create(obj.render_state.buffers[3], 0, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)
+        .map([&](BufferMapping m) {
+            memcpy(m.mapped_addr, obj.draws_data.data(), obj.draws_data.size() * sizeof(DrawElementsIndirectCommand));
+        });
+
+    obj.geometry_nodes = std::move(geometry->nodes);
+    for (size_t i = 0, count = obj.geometry_nodes.size(); i < count; ++i) {
+        obj.nodes_visibility.set(i, true);
+    }
+
+    glCreateVertexArrays(1, &obj.render_state.vertex_array);
 
     for (size_t i = 0; i < size(FormatDescriptors<GeometryVertex>::descriptors); ++i) {
         const VertexFormatDescriptor& fd = FormatDescriptors<GeometryVertex>::descriptors[i];
-        glVertexArrayAttribFormat(obj.vertex_array, i, fd.size, fd.type, fd.normalized, fd.offset);
-        glEnableVertexArrayAttrib(obj.vertex_array, i);
-        glVertexArrayAttribBinding(obj.vertex_array, i, 0);
+        glVertexArrayAttribFormat(obj.render_state.vertex_array, i, fd.size, fd.type, fd.normalized, fd.offset);
+        glEnableVertexArrayAttrib(obj.render_state.vertex_array, i);
+        glVertexArrayAttribBinding(obj.render_state.vertex_array, i, 0);
     }
 
-    glVertexArrayVertexBuffer(obj.vertex_array, 0, obj.buffers[0], 0, sizeof(GeometryVertex));
-    glVertexArrayElementBuffer(obj.vertex_array, obj.buffers[1]);
+    glVertexArrayVertexBuffer(obj.render_state.vertex_array, 0, obj.render_state.buffers[0], 0, sizeof(GeometryVertex));
+    glVertexArrayElementBuffer(obj.render_state.vertex_array, obj.render_state.buffers[1]);
 
-    glCreateProgramPipelines(size(obj.program_pipeline), obj.program_pipeline);
+    glCreateProgramPipelines(size(obj.render_state.program_pipeline), obj.render_state.program_pipeline);
     constexpr const tuple<const char*, const char*, GLbitfield> shader_create_data[] = {
         { "data/shaders/triangle/tri.vert", "main", GL_VERTEX_SHADER_BIT },
         { "data/shaders/triangle/tri.frag", "main", GL_FRAGMENT_SHADER_BIT }
@@ -1138,8 +1184,8 @@ SimpleDemo::create()
         if (!shader_prog)
             return tl::make_unexpected(shader_prog.error());
 
-        obj.gpu_programs[idx++] = *shader_prog;
-        glUseProgramStages(obj.program_pipeline[0], shader_stage, *shader_prog);
+        obj.render_state.gpu_programs[idx++] = *shader_prog;
+        glUseProgramStages(obj.render_state.program_pipeline[0], shader_stage, *shader_prog);
     }
 
     auto maybe_texture = Texture::from_file("data/textures/ash_uvgrid02.jpg");
@@ -1147,12 +1193,11 @@ SimpleDemo::create()
         return tl::make_unexpected(maybe_texture.error());
     }
 
-    obj.texture = *maybe_texture;
-    obj.indexcount = counts.y;
+    obj.render_state.texture = *maybe_texture;
 
-    glCreateSamplers(1, &obj.sampler);
-    glSamplerParameteri(obj.sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glSamplerParameteri(obj.sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glCreateSamplers(1, &obj.render_state.sampler);
+    glSamplerParameteri(obj.render_state.sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glSamplerParameteri(obj.render_state.sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     return tl::expected<SimpleDemo, GenericProgramError>{ std::move(obj) };
 }

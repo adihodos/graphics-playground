@@ -21,3 +21,12 @@ struct DrawParams
     int32_t display_height;
     ArcballCamera* cam;
 };
+
+struct DrawElementsIndirectCommand
+{
+    GLuint count;
+    GLuint instanceCount;
+    GLuint firstIndex;
+    GLuint baseVertex;
+    GLuint baseInstance;
+};
